@@ -383,6 +383,9 @@ signal_handle_dup(dcontext_t *dcontext, file_t src, file_t dst);
 
 void
 signal_handle_close(dcontext_t *dcontext, file_t fd);
+
+void
+signal_handle_close_range(dcontext_t *dcontext, uint first, uint last);
 #endif
 
 void
