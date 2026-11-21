@@ -7414,6 +7414,42 @@ receive_pending_signal(dcontext_t *dcontext)
         special_heap_free(info->sigheap, temp2);
         special_heap_free(info->sigheap, temp3);
     }
+    /* A signal can interrupt an auto-restart syscall, after which another signal
+     * can arrive before we reach dispatch.  Pending signals are not necessarily
+     * delivered in arrival order.  Restore the interrupted syscall once, before
+     * delivering any of them: otherwise a later delivery can restore an old
+     * register/stack context after the application has already made progress.
+     *
+     * Keep signal selection and blocking unchanged.  In particular, a suppressed,
+     * ignored, or rerouted signal must not discard the syscall's restart.  The
+     * application has not run since the interrupted syscall, so there can be at
+     * most one such context.  FP state remains handled at delivery as before.
+     */
+    sigpending_t *restart = NULL;
+    for (int i = 1; i <= MAX_SIGNUM; i++) {
+        for (sigpending_t *pending = info->sigpending[i]; pending != NULL;
+             pending = pending->next) {
+            if (pending->use_sigcontext) {
+                ASSERT(restart == NULL);
+                if (restart == NULL)
+                    restart = pending;
+            }
+        }
+    }
+    if (restart != NULL) {
+        kernel_ucontext_t *uc = get_ucontext_from_rt_frame(&restart->rt_frame);
+        sigcontext_t *sc = SIGCXT_FROM_UCXT(uc);
+        sig_full_cxt_t sc_full;
+        sig_full_initialize(&sc_full, uc);
+        dcontext->next_tag = canonicalize_pc_target(dcontext, (app_pc)sc->SC_XIP);
+        /* Preserve the current application SIMD state.  The raw pending frame
+         * has not yet had save_fpstate() repair its state for delivery.
+         */
+        sigcontext_to_mcontext(get_mcontext(dcontext), &sc_full,
+                               DR_MC_INTEGER | DR_MC_CONTROL);
+        IF_ARM(dr_set_isa_mode(dcontext, get_pc_mode_from_cpsr(sc), NULL));
+        restart->use_sigcontext = false;
+    }
     for (sig = 1; sig <= MAX_SIGNUM; sig++) {
         if (info->sigpending[sig] != NULL) {
             bool executing = true;
@@ -7463,9 +7499,9 @@ receive_pending_signal(dcontext_t *dcontext)
         }
     }
     /* Only one signal can be delivered ignoring the back-in-dispatch blocked set. */
-    for (sig = 1; sig <= MAX_SIGNUM; sig++) {
-        if (info->sigpending[sig] != NULL && info->sigpending[sig]->unblocked_at_receipt)
-            info->sigpending[sig]->unblocked_at_receipt = false;
+    for (int i = 1; i <= MAX_SIGNUM; i++) {
+        if (info->sigpending[i] != NULL && info->sigpending[i]->unblocked_at_receipt)
+            info->sigpending[i]->unblocked_at_receipt = false;
     }
     /* barrier to prevent compiler from moving the below write above the loop */
     __asm__ __volatile__("" : : : "memory");
