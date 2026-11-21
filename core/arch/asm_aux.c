@@ -282,6 +282,7 @@ new_thread_setup(priv_mcontext_t *mc)
 
     /* i#149/PR 403015: clone_record_t is passed via dstack. */
     crec = get_clone_record(mc->xsp);
+    IF_LINUX(signal_prepare_clone_child(crec));
     LOG(GLOBAL, LOG_INTERP, 1,
         "new_thread_setup: thread " TIDFMT ", dstack " PFX " clone record " PFX "\n",
         d_r_get_thread_id(), get_clone_record_dstack(crec), crec);
@@ -319,6 +320,7 @@ new_thread_setup(priv_mcontext_t *mc)
     restore_clone_param_from_clone_record(dcontext, crec);
 
     thread_starting(dcontext);
+    IF_LINUX(signal_finish_clone_child(dcontext, crec));
 
     call_switch_stack(dcontext, dcontext->dstack, (void (*)(void *))d_r_dispatch,
                       NULL /*not on d_r_initstack*/, false /*shouldn't return*/);

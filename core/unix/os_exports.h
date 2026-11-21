@@ -578,6 +578,13 @@ get_clone_record_thread_arg(void *record);
 
 void *
 get_clone_record(reg_t xsp);
+
+#ifdef LINUX
+void
+signal_prepare_clone_child(void *clone_record);
+void
+signal_finish_clone_child(dcontext_t *dcontext, void *clone_record);
+#endif
 reg_t
 get_clone_record_app_xsp(void *record);
 byte *
