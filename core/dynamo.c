@@ -1261,11 +1261,13 @@ synch_with_threads_at_exit(thread_synch_state_t synch_res, bool pre_exit)
 {
     int num_threads;
     thread_record_t **threads;
-    DEBUG_DECLARE(bool ok;)
-    /* If we fail to suspend a thread (e.g., privilege
-     * problems) ignore it. XXX: retry instead?
+    dcontext_t *dcontext = get_thread_private_dcontext();
+    int expected_exiting = dcontext != NULL && dcontext->is_exiting ? 1 : 0;
+    /* An OS failure cannot be recovered here: earlier successful iterations may
+     * already have freed thread records. Terminate without cleanup, rather than
+     * entering the ABORT path that resumes/dereferences those records.
      */
-    uint flags = THREAD_SYNCH_SUSPEND_FAILURE_IGNORE;
+    uint flags = THREAD_SYNCH_SUSPEND_FAILURE_IGNORE | THREAD_SYNCH_TERMINATE_ON_FAILURE;
     if (pre_exit) {
         /* i#297: we only synch client threads after process exit event. */
         flags |= THREAD_SYNCH_SKIP_CLIENT_THREAD;
@@ -1293,14 +1295,20 @@ synch_with_threads_at_exit(thread_synch_state_t synch_res, bool pre_exit)
      * loop to a stack-free loop (xref i#95).
      */
     IF_UNIX(dynamo_exiting = true;) /* include execve-exited vfork threads */
-    DEBUG_DECLARE(ok =)
-    synch_with_all_threads(synch_res, &threads, &num_threads,
-                           /* Case 6821: other synch-all-thread uses that
-                            * only care about threads carrying fcache
-                            * state can ignore us
-                            */
-                           THREAD_SYNCH_NO_LOCKS_NO_XFER, flags);
-    ASSERT(ok);
+    bool stopped =
+        synch_with_all_threads(synch_res, &threads, &num_threads,
+                               /* Case 6821: other synch-all-thread uses that only care
+                                * about threads carrying fcache state can ignore us. */
+                               THREAD_SYNCH_NO_LOCKS_NO_XFER, flags);
+    /* A bounded synchronization attempt can exhaust its retries. Never run
+     * client exit callbacks or free TLS/cache state while a thread can still
+     * execute instrumented code. The helper holds thread_initexit_lock here;
+     * also require in-flight exits/initializations to have reached its barrier.
+     * Terminate without cleanup: retrying exit callbacks would be unsafe.
+     */
+    if (!stopped || exiting_thread_count != expected_exiting || uninit_thread_count != 0)
+        REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
+                                    get_application_name(), get_application_pid());
     ASSERT(threads == NULL && num_threads == 0); /* We asked for CLEANED */
     /* the synch_with_all_threads function grabbed the
      * thread_initexit_lock for us! */

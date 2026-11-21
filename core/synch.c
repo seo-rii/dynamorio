@@ -944,6 +944,18 @@ synch_thread_yield(void)
  * enter_couldbelinking state)
  * NOTE - you can't call this with a thread that you've already suspended
  */
+/* A process-exit synchronization may already have cleaned other threads.
+ * Fail before this thread is touched further, without resuming or walking the
+ * partially freed set and without invoking terminal client callbacks.
+ */
+static void
+terminate_on_synch_failure(uint flags)
+{
+    if (TESTANY(THREAD_SYNCH_TERMINATE_ON_FAILURE, flags))
+        REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
+                                    get_application_name(), get_application_pid());
+}
+
 thread_synch_result_t
 synch_with_thread(thread_id_t id, bool block, bool hold_initexit_lock,
                   thread_synch_permission_t caller_state,
@@ -1034,6 +1046,7 @@ synch_with_thread(thread_id_t id, bool block, bool hold_initexit_lock,
                 first_loop = false;
             }
             if (!os_thread_suspend(trec)) {
+                terminate_on_synch_failure(flags);
                 /* XXX : eventually should be a real assert once we figure out
                  * how to handle threads with low privilege handles */
                 /* For dr_api_exit, we may have missed a thread exit. */
@@ -1048,6 +1061,7 @@ synch_with_thread(thread_id_t id, bool block, bool hold_initexit_lock,
                 break;
             }
             if (!thread_get_mcontext(trec, &mc)) {
+                terminate_on_synch_failure(flags);
                 /* XXX : eventually should be a real assert once we figure out
                  * how to handle threads with low privilege handles */
                 ASSERT_CURIOSITY_ONCE(false &&
@@ -1077,6 +1091,7 @@ synch_with_thread(thread_id_t id, bool block, bool hold_initexit_lock,
                 RSTATS_INC(synchs_not_at_safe_spot);
             }
             if (!os_thread_resume(trec)) {
+                terminate_on_synch_failure(flags);
                 ASSERT_NOT_REACHED();
                 res = (TESTANY(THREAD_SYNCH_SUSPEND_FAILURE_IGNORE, flags)
                            ? THREAD_SYNCH_RESULT_SUCCESS
