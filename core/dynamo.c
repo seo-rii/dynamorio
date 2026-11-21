@@ -1989,13 +1989,12 @@ void
 mark_thread_execve(thread_record_t *tr, bool execve)
 {
     ASSERT((execve && !tr->execve) || (!execve && tr->execve));
-    tr->execve = execve;
     d_r_mutex_lock(&all_threads_lock);
+    /* Publish the marker and count together for thread-list snapshots.
+     * Different application threads may have concurrent vfork children.
+     */
+    tr->execve = execve;
     if (execve) {
-        /* since we free on a second vfork we should never accumulate
-         * more than one
-         */
-        ASSERT(num_execve_threads == 0);
         num_execve_threads++;
     } else {
         ASSERT(num_execve_threads > 0);
@@ -2052,8 +2051,8 @@ get_list_of_threads_common(thread_record_t ***list,
     for (i = 0; i < HASHTABLE_SIZE(ALL_THREADS_HASH_BITS); i++) {
         for (tr = all_threads[i]; tr != NULL; tr = tr->next) {
             /* include those for which !tr->under_dynamo_control */
-            /* don't include those that exited for execve.  there should be
-             * no race b/c vfork suspends the parent.  xref i#237/PR 498284.
+            /* Hide execve transitions from ordinary snapshots.  The vfork
+             * parent reclaims its own child only after the kernel returns.
              */
             if (IF_UNIX_ELSE(!tr->execve || include_execve || dynamo_exiting, true)) {
                 mylist[cur] = tr;
