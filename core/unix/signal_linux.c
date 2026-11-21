@@ -562,3 +562,14 @@ signal_handle_close(dcontext_t *dcontext, file_t fd)
     }
     TABLE_RWLOCK(sigfd_table, write, unlock);
 }
+
+/* Remove only tracked signalfds, rather than walking every integer in a
+ * potentially UINT_MAX-sized close_range request. The table owns pipe refs.
+ */
+void
+signal_handle_close_range(dcontext_t *dcontext, uint first, uint last)
+{
+    TABLE_RWLOCK(sigfd_table, write, lock);
+    generic_hash_range_remove(GLOBAL_DCONTEXT, sigfd_table, first, (ptr_uint_t)last + 1);
+    TABLE_RWLOCK(sigfd_table, write, unlock);
+}
