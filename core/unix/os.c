@@ -2969,6 +2969,41 @@ os_new_thread_pre(void)
     ATOMIC_INC(int, uninit_thread_count);
 }
 
+#ifdef LINUX
+/* Called only in the parent, after DR and private-library TLS are restored.
+ * A successful child owns its stack and may already have exited: do not
+ * dereference the saved record in that case.
+ */
+static void
+os_new_thread_post(dcontext_t *dcontext, bool success)
+{
+    void *record = dcontext->pending_clone_record;
+    ASSERT(record != NULL);
+    dcontext->pending_clone_record = NULL;
+    if (!success) {
+        d_r_mutex_lock(&thread_initexit_lock);
+        destroy_failed_clone_record(dcontext, record);
+        ASSERT(uninit_thread_count > 0);
+        ATOMIC_DEC(int, uninit_thread_count);
+        d_r_mutex_unlock(&thread_initexit_lock);
+    }
+}
+
+/* Serialize publication with abortable synch-all's suspend decision.  This must
+ * run with DR TLS, before os_clone_pre() on entry and after its restoration on
+ * return.  Child initialization does not end the parent's kernel vfork wait.
+ */
+static void
+set_vfork_in_progress(dcontext_t *dcontext, bool in_progress)
+{
+    ASSERT(!is_couldbelinking(dcontext));
+    d_r_mutex_lock(&thread_initexit_lock);
+    ASSERT(dcontext->vfork_in_progress != in_progress);
+    dcontext->vfork_in_progress = in_progress;
+    d_r_mutex_unlock(&thread_initexit_lock);
+}
+#endif
+
 /* This is called from pre_system_call() and before cloning a client thread in
  * dr_create_client_thread. Hence os_clone_pre is used for app threads as well
  * as client threads. Do not add anything that we do not want to happen while
@@ -7317,6 +7352,7 @@ handle_clone_pre(dcontext_t *dcontext)
      * Note: This must be done after sys_param0 is set.
      */
     if (is_thread_create_syscall(dcontext, dr_clone_args)) {
+        ASSERT(dcontext->pending_clone_record == NULL);
         if (dcontext->sys_num == SYS_clone3) {
             /* create_clone_record modifies some fields in clone_args for the
              * clone3 syscall. Instead of reusing the app's copy of
@@ -7339,7 +7375,8 @@ handle_clone_pre(dcontext_t *dcontext)
             *sys_param_addr(dcontext, SYSCALL_PARAM_CLONE3_CLONE_ARGS) =
                 (reg_t)dr_clone_args;
             /* The pointer to the app's clone_args was saved in sys_param0 above. */
-            create_clone_record(dcontext, NULL, dr_clone_args, app_clone_args);
+            dcontext->pending_clone_record =
+                create_clone_record(dcontext, NULL, dr_clone_args, app_clone_args);
         } else {
             /* We replace the app-provided stack pointer with our own stack
              * pointer in create_clone_record. Save the original pointer so
@@ -7347,10 +7384,12 @@ handle_clone_pre(dcontext_t *dcontext)
              * restored in the child in restore_clone_param_from_clone_record.
              */
             dcontext->sys_param1 = sys_param(dcontext, SYSCALL_PARAM_CLONE_STACK);
-            create_clone_record(dcontext,
-                                sys_param_addr(dcontext, SYSCALL_PARAM_CLONE_STACK), NULL,
-                                NULL);
+            dcontext->pending_clone_record = create_clone_record(
+                dcontext, sys_param_addr(dcontext, SYSCALL_PARAM_CLONE_STACK), NULL,
+                NULL);
         }
+        if (TESTANY(CLONE_VFORK, flags))
+            set_vfork_in_progress(dcontext, true);
         os_clone_pre(dcontext);
         os_new_thread_pre();
     } else {
@@ -7838,9 +7877,11 @@ pre_system_call(dcontext_t *dcontext)
 #    ifdef MACOS
         create_clone_record(dcontext, (reg_t *)&mc->xsp, NULL, NULL);
 #    else
-        create_clone_record(dcontext, (reg_t *)&mc->xsp /*child uses parent sp*/, NULL,
-                            NULL);
+        ASSERT(dcontext->pending_clone_record == NULL);
+        dcontext->pending_clone_record = create_clone_record(
+            dcontext, (reg_t *)&mc->xsp /*child uses parent sp*/, NULL, NULL);
 #    endif
+        IF_LINUX(set_vfork_in_progress(dcontext, true));
         os_clone_pre(dcontext);
         os_new_thread_pre();
         break;
@@ -9487,13 +9528,15 @@ post_system_call(dcontext_t *dcontext)
          */
         if (was_thread_create_syscall(dcontext)) {
             /* Read clone3 flags before freeing DR's saved clone_args. */
-            bool completed_vfork = success && result > 0 &&
+            bool was_vfork =
                 TESTANY(CLONE_VFORK,
                         sysnum == SYS_clone3 ? get_stored_clone3_flags(dcontext)
                                              : dcontext->sys_param0);
+            bool completed_vfork = success && result > 0 && was_vfork;
             if (INTERNAL_OPTION(private_loader))
                 os_switch_lib_tls(dcontext, false /*to dr*/);
             /* i#2089: we already restored the DR tls in os_clone_post() */
+            os_new_thread_post(dcontext, success);
 
             if (sysnum == SYS_clone3) {
                 /* Free DR's copy of clone_args and restore the pointer to the
@@ -9522,6 +9565,9 @@ post_system_call(dcontext_t *dcontext)
             }
             if (completed_vfork)
                 cleanup_after_vfork_execve(dcontext, (thread_id_t)result);
+            /* A failed clone also releases the pre-syscall publication. */
+            if (was_vfork)
+                set_vfork_in_progress(dcontext, false);
         }
         break;
     }
@@ -9564,8 +9610,10 @@ post_system_call(dcontext_t *dcontext)
             }
             /* i#2089: we already restored the DR tls in os_clone_post() */
         }
+        IF_LINUX(os_new_thread_post(dcontext, success));
         if (success && result > 0)
             cleanup_after_vfork_execve(dcontext, (thread_id_t)result);
+        IF_LINUX(set_vfork_in_progress(dcontext, false));
         break;
     }
 #endif

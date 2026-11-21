@@ -862,6 +862,18 @@ struct _dcontext_t {
     reg_t sys_param4; /* used for post_system_call i#173 and i#2759 */
     bool sys_was_int; /* was the last system call via do_int_syscall? */
     bool sys_xbp;     /* PR 313715: store orig xbp */
+#    ifdef LINUX
+    /* Protected by thread_initexit_lock.  Published before a shared-VM vfork
+     * syscall and cleared only when that parent returns from the kernel.
+     * A parent waiting for its child cannot acknowledge a suspend signal.
+     */
+    bool vfork_in_progress;
+    /* Parent-side handle to the stack reserved for an app clone.  On success
+     * the child owns it and may already have freed it before the parent runs;
+     * only a failed kernel clone permits dereferencing this handle.
+     */
+    void *pending_clone_record;
+#    endif
 #    ifdef DEBUG
     bool mprot_multi_areas; /* PR 410921: mprotect of 2 or more vmareas? */
 #    endif
