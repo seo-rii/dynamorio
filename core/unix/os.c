@@ -1967,6 +1967,18 @@ is_DR_segment_reader_entry(app_pc pc)
     return false;
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+ushort
+os_ibl_pending_target_offset(void)
+{
+    size_t offset = offsetof(os_local_state_t, ibl_pending_target) -
+        offsetof(os_local_state_t, state);
+    ASSERT(offset <= USHRT_MAX);
+    ASSERT(offsetof(os_local_state_t, ibl_pending_target) + sizeof(app_pc) <= PAGE_SIZE);
+    return (ushort)offset;
+}
+#endif
+
 #if defined(X86) || defined(DEBUG)
 static bool
 is_thread_tls_allocated(void)
