@@ -578,6 +578,12 @@ get_clone_record_thread_arg(void *record);
 
 void *
 get_clone_record(reg_t xsp);
+
+#ifdef LINUX
+/* No child was created; caller holds thread_initexit_lock. */
+void
+destroy_failed_clone_record(dcontext_t *dcontext, void *clone_record);
+#endif
 reg_t
 get_clone_record_app_xsp(void *record);
 byte *
