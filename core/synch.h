@@ -120,6 +120,13 @@ enum {
 
     /* specifies whether we should terminate client threads */
     THREAD_SYNCH_SKIP_CLIENT_THREAD = 0x00000010,
+
+    /* Process-exit modifier: an OS suspend/context/resume failure terminates the
+     * entire process without cleanup. This overrides the failure policy above;
+     * the CLEANED exit path cannot safely unwind already-freed thread records.
+     * Ordinary suspension and detach callers must not set this modifier.
+     */
+    THREAD_SYNCH_TERMINATE_ON_FAILURE = 0x00000020,
 };
 
 /* convenience macros */
