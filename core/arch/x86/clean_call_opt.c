@@ -585,6 +585,17 @@ analyze_clean_call_aflags(dcontext_t *dcontext, clean_call_info_t *cci, instr_t 
     callee_info_t *ci = cci->callee_info;
     instr_t *instr;
 
+    /* -no_cleancall_ignore_eflags asks that a callee never run with the
+     * application's eflags.  Arithmetic-flag analysis is not enough for that: a
+     * callee that reads no flag still depends on EFLAGS.AC through every memory
+     * access, and an application that enables alignment checking would make an
+     * unaligned access in the callee fault.  Keep the full save/clear/restore.
+     */
+    if (!dynamo_options.cleancall_ignore_eflags) {
+        cci->skip_clear_flags = false;
+        cci->skip_save_flags = false;
+        return;
+    }
     /* If there's a flags read, we clear the flags.  If there's a write or read,
      * we save them, because a read creates a clear which is a write. */
     cci->skip_clear_flags = !ci->read_flags;
