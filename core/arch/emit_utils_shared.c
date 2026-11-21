@@ -3179,6 +3179,16 @@ append_ibl_found(dcontext_t *dcontext, instrlist_t *ilist, ibl_code_t *ibl_code,
         restore_eflags = true;
     }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (target_prefix) {
+        /* i#5061: the matched entry's tag can become FAKE_TAG before we
+         * jump through its start_pc.  Save the original target before hit
+         * statistics or register restoration can clobber SCRATCH_REG1.
+         */
+        APP(ilist, SAVE_TO_TLS(dcontext, SCRATCH_REG1, os_ibl_pending_target_offset()));
+    }
+#endif
+
 #ifdef HASHTABLE_STATISTICS
     if (INTERNAL_OPTION(hashtable_ibl_stats) ||
         INTERNAL_OPTION(hashtable_ibl_entry_stats)) {

@@ -253,6 +253,12 @@ set_thread_private_dcontext(dcontext_t *dcontext);
 int
 os_tls_offset(ushort tls_offs);
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* Local-state offset of the original target retained across an IBL hit. */
+ushort
+os_ibl_pending_target_offset(void);
+#endif
+
 /* Converts a signed segment displacement to a local-state slot offset relative
  * to tls_base. Returns false if the local-state offset does not fit in ushort.
  * Pass os_tls_offset(0) for the current OS's local-state base displacement.

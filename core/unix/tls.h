@@ -319,6 +319,13 @@ typedef struct _os_local_state_t {
     /* Whether privload_tls_init() was used to set up client thread TLS. */
     bool custom_privlib_tls;
 #endif
+#if defined(LINUX) && defined(X86) && defined(X64)
+    /* An IBL hit must retain its original target when another thread retires
+     * the table entry before the indirect jump.  Keep this after existing TLS
+     * fields so their offsets (including assembly and client slots) do not move.
+     */
+    app_pc ibl_pending_target;
+#endif
 } os_local_state_t;
 
 os_local_state_t *
