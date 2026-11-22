@@ -6365,6 +6365,10 @@ if (UNIX)
     tobuild_ops(linux.vfork linux/vfork.c "" "${execve-sub-path}")
     #tobuild(linux.vfork-fib linux/vfork-fib.c)
   endif ()
+  if (LINUX AND X86 AND X64)
+    # The clone3 trampoline is x86-64 assembly.
+    tobuild(linux.clone3-clear-sighand linux/clone3-clear-sighand.c)
+  endif ()
 
   if (NOT RISCV64)
     # runs of other builds with custom DR options
