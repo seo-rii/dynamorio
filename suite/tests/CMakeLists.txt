@@ -6282,6 +6282,9 @@ if (UNIX)
   tobuild(linux.eintr linux/eintr.c)
   link_with_pthread(linux.eintr)
   torunonly(linux.eintr-noinline linux.eintr linux/eintr.c "-no_ignore_syscalls" "")
+  if (LINUX)
+    tobuild(linux.close_range linux/close_range.c)
+  endif ()
 
   if (NOT ANDROID AND NOT RISCV64) # XXX i#1874: get working on Android
     # TODO i#3544: Port tests to RISC-V 64
