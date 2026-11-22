@@ -2973,6 +2973,11 @@ if (NOT ARM AND NOT RISCV64) # XXX i#2094: implement cleancall optimizations on 
   endif ()
 
   tobuild_ci(client.inline client-interface/inline.c "" "-opt_cleancall 3" "")
+  if (X86 AND X64 AND LINUX)
+    # Full eflags handling around optimized clean calls (EFLAGS.AC).
+    tobuild_ci(client.cleancall-eflags-ac client-interface/cleancall-eflags-ac.c ""
+      "-no_cleancall_ignore_eflags" "")
+  endif ()
   if (CMAKE_COMPILER_IS_CLANG)
     optimize(client.inline.dll)
   endif ()
