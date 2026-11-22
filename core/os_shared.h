@@ -253,8 +253,10 @@ set_thread_private_dcontext(dcontext_t *dcontext);
 int
 os_tls_offset(ushort tls_offs);
 
-#if defined(LINUX) && defined(X86) && defined(X64)
-/* Local-state offset of the original target retained across an IBL hit. */
+#if defined(LINUX) && !defined(LINUX_KERNEL) && defined(X86) && defined(X64)
+/* Local-state offset of the original target retained across an IBL hit.
+ * The kernel module has no os_local_state_t slot for it yet.
+ */
 ushort
 os_ibl_pending_target_offset(void);
 #endif
