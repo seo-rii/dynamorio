@@ -1263,11 +1263,10 @@ synch_with_threads_at_exit(thread_synch_state_t synch_res, bool pre_exit)
     thread_record_t **threads;
     dcontext_t *dcontext = get_thread_private_dcontext();
     int expected_exiting = dcontext != NULL && dcontext->is_exiting ? 1 : 0;
-    /* An OS failure cannot be recovered here: earlier successful iterations may
-     * already have freed thread records. Terminate without cleanup, rather than
-     * entering the ABORT path that resumes/dereferences those records.
+    /* If we fail to suspend a thread (e.g., privilege
+     * problems) ignore it. XXX: retry instead?
      */
-    uint flags = THREAD_SYNCH_SUSPEND_FAILURE_IGNORE | THREAD_SYNCH_TERMINATE_ON_FAILURE;
+    uint flags = THREAD_SYNCH_SUSPEND_FAILURE_IGNORE;
     if (pre_exit) {
         /* i#297: we only synch client threads after process exit event. */
         flags |= THREAD_SYNCH_SKIP_CLIENT_THREAD;
@@ -1300,11 +1299,12 @@ synch_with_threads_at_exit(thread_synch_state_t synch_res, bool pre_exit)
                                /* Case 6821: other synch-all-thread uses that only care
                                 * about threads carrying fcache state can ignore us. */
                                THREAD_SYNCH_NO_LOCKS_NO_XFER, flags);
-    /* A bounded synchronization attempt can exhaust its retries. Never run
-     * client exit callbacks or free TLS/cache state while a thread can still
-     * execute instrumented code. The helper holds thread_initexit_lock here;
-     * also require in-flight exits/initializations to have reached its barrier.
-     * Terminate without cleanup: retrying exit callbacks would be unsafe.
+    /* A bounded synchronization attempt can give up.  Never run client exit
+     * events or free TLS and cache state while a thread can still execute code
+     * cache code.  The helper holds thread_initexit_lock here; also require
+     * in-flight thread exits and initializations to have reached its barrier.
+     * Terminate without cleanup: retrying the exit events would be unsafe.
+     * Failing to suspend a thread that has already exited stays ignored.
      */
     if (!stopped || exiting_thread_count != expected_exiting ||
         uninit_thread_count != 0) {
