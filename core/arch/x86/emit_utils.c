@@ -2734,7 +2734,7 @@ emit_indirect_branch_lookup(dcontext_t *dcontext, generated_code_t *code, byte *
                                absolute _IF_X64(x86_to_x64_ibl_opt));
         }
     } else {
-#if defined(LINUX) && defined(X64)
+#if defined(LINUX) && !defined(LINUX_KERNEL) && defined(X64)
         /* i#5061: removal changes the entry tag to FAKE_TAG.  The hit path
          * retained the original application target before restoring XBX.
          */

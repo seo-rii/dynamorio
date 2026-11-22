@@ -3179,7 +3179,7 @@ append_ibl_found(dcontext_t *dcontext, instrlist_t *ilist, ibl_code_t *ibl_code,
         restore_eflags = true;
     }
 
-#if defined(LINUX) && defined(X86) && defined(X64)
+#if defined(LINUX) && !defined(LINUX_KERNEL) && defined(X86) && defined(X64)
     if (target_prefix) {
         /* i#5061: the matched entry's tag can become FAKE_TAG before we
          * jump through its start_pc.  Save the original target before hit
