@@ -951,9 +951,10 @@ synch_thread_yield(void)
 static void
 terminate_on_synch_failure(uint flags)
 {
-    if (TESTANY(THREAD_SYNCH_TERMINATE_ON_FAILURE, flags))
+    if (TESTANY(THREAD_SYNCH_TERMINATE_ON_FAILURE, flags)) {
         REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
                                     get_application_name(), get_application_pid());
+    }
 }
 
 thread_synch_result_t
