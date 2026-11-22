@@ -1306,9 +1306,11 @@ synch_with_threads_at_exit(thread_synch_state_t synch_res, bool pre_exit)
      * also require in-flight exits/initializations to have reached its barrier.
      * Terminate without cleanup: retrying exit callbacks would be unsafe.
      */
-    if (!stopped || exiting_thread_count != expected_exiting || uninit_thread_count != 0)
+    if (!stopped || exiting_thread_count != expected_exiting ||
+        uninit_thread_count != 0) {
         REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
                                     get_application_name(), get_application_pid());
+    }
     ASSERT(threads == NULL && num_threads == 0); /* We asked for CLEANED */
     /* the synch_with_all_threads function grabbed the
      * thread_initexit_lock for us! */
