@@ -2973,6 +2973,11 @@ if (NOT ARM AND NOT RISCV64) # XXX i#2094: implement cleancall optimizations on 
   endif ()
 
   tobuild_ci(client.inline client-interface/inline.c "" "-opt_cleancall 3" "")
+  if (X86 AND X64 AND LINUX)
+    # Full eflags handling around optimized clean calls (EFLAGS.AC).
+    tobuild_ci(client.cleancall-eflags-ac client-interface/cleancall-eflags-ac.c ""
+      "-no_cleancall_ignore_eflags" "")
+  endif ()
   if (CMAKE_COMPILER_IS_CLANG)
     optimize(client.inline.dll)
   endif ()
@@ -5978,6 +5983,8 @@ if (UNIX)
 
   if (NOT APPLE AND NOT RISCV64) # TODO i#3544: Port tests to RISC-V 64
     tobuild(linux.clone linux/clone.c)
+    # Failed thread-creation clones must release their reserved state.
+    tobuild(linux.clone-fail linux/clone-fail.c)
 
     # A PIE build tests MSR-based TLS instead of GDT-based (i#2089).
     tobuild(linux.clone-pie linux/clone.c)
@@ -6282,6 +6289,9 @@ if (UNIX)
   tobuild(linux.eintr linux/eintr.c)
   link_with_pthread(linux.eintr)
   torunonly(linux.eintr-noinline linux.eintr linux/eintr.c "-no_ignore_syscalls" "")
+  if (LINUX)
+    tobuild(linux.close_range linux/close_range.c)
+  endif ()
 
   if (NOT ANDROID AND NOT RISCV64) # XXX i#1874: get working on Android
     # TODO i#3544: Port tests to RISC-V 64
@@ -6364,6 +6374,14 @@ if (UNIX)
     # TODO i#3544: Port tests to RISC-V 64
     tobuild_ops(linux.vfork linux/vfork.c "" "${execve-sub-path}")
     #tobuild(linux.vfork-fib linux/vfork-fib.c)
+    # Concurrent vfork children of different parent threads.
+    tobuild_ops(linux.vfork-concurrent linux/vfork-concurrent.c "" "${execve-sub-path}")
+    link_with_pthread(linux.vfork-concurrent)
+  endif ()
+  if (LINUX AND X86 AND X64)
+    # The clone3 trampoline and x87 probe are x86-64 assembly.
+    tobuild(linux.clone3-clear-sighand linux/clone3-clear-sighand.c)
+    tobuild(linux.signal-x87-status linux/signal-x87-status.c)
   endif ()
 
   if (NOT RISCV64)
