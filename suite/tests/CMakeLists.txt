@@ -6365,6 +6365,10 @@ if (UNIX)
     tobuild_ops(linux.vfork linux/vfork.c "" "${execve-sub-path}")
     #tobuild(linux.vfork-fib linux/vfork-fib.c)
   endif ()
+  if (LINUX AND X86 AND X64)
+    # The x87 probe is x86-64 assembly.
+    tobuild(linux.signal-x87-status linux/signal-x87-status.c)
+  endif ()
 
   if (NOT RISCV64)
     # runs of other builds with custom DR options
