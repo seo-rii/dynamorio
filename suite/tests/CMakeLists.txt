@@ -6256,6 +6256,13 @@ if (UNIX)
       link_with_pthread(linux.synchall-restore)
     endif ()
 
+    if (X86) # The test generates x86 code.
+      # -slowdown_ibl_found takes effect only with internal options.
+      tobuild_ops(linux.ibl-delete-race linux/ibl-delete-race.c
+        "-disable_traces -slowdown_ibl_found 20000" "")
+      link_with_pthread(linux.ibl-delete-race)
+    endif ()
+
     if (NOT ANDROID)
       tobuild(linux.threadexit2 linux/threadexit2.c) # XXX i#1874: hangs on Android
       tobuild(linux.signalfd linux/signalfd.c) # XXX i#1874: fails natively on Android
