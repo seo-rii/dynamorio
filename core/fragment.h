@@ -1031,6 +1031,12 @@ bool
 enter_couldbelinking(dcontext_t *dcontext, fragment_t *watch, bool temporary);
 
 void
+acquire_linking_lock_in_fragment(dcontext_t *dcontext);
+
+void
+release_linking_lock_in_fragment(dcontext_t *dcontext);
+
+void
 enter_threadexit(dcontext_t *dcontext);
 
 uint
