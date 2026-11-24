@@ -78,15 +78,18 @@ caller(void *arg)
 int
 main(void)
 {
-    static const unsigned char body[] = {
 #ifdef X64
-        0x8d, 0x47, 0x01, /* lea eax, [rdi+1] */
+    static const unsigned char body[] = {
+        0x48, 0x8d, 0x47, 0x01, /* lea rax, [rdi+1] */
+        0xc3,                   /* ret */
+    };
 #else
+    static const unsigned char body[] = {
         0x8b, 0x44, 0x24, 0x04, /* mov eax, [esp+4] */
         0x40,                   /* inc eax */
-#endif
-        0xc3, /* ret */
+        0xc3,                   /* ret */
     };
+#endif
     code = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (code == MAP_FAILED) {

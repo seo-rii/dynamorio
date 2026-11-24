@@ -3204,6 +3204,7 @@ append_ibl_found(dcontext_t *dcontext, instrlist_t *ilist, ibl_code_t *ibl_code,
     }
 #endif /* HASHTABLE_STATISTICS */
 
+#ifdef X86
     if (target_prefix) {
         /* The target_delete path needs the tag, and it cannot reload it from the
          * table entry: a racing fragment_prepare_for_removal_from_table()
@@ -3224,6 +3225,7 @@ append_ibl_found(dcontext_t *dcontext, instrlist_t *ilist, ibl_code_t *ibl_code,
         else
             APP(ilist, SAVE_TO_TLS(dcontext, SCRATCH_REG1, IBL_HIT_TAG_SLOT));
     }
+#endif
 
 #ifdef INTERNAL
     if (INTERNAL_OPTION(slowdown_ibl_found)) {
