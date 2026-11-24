@@ -1038,7 +1038,12 @@ add_vm_area(vm_area_vector_t *v, app_pc start, app_pc end, uint vm_flags, uint f
 #endif
             /* disallow any other vm_flag differences */
             DODEBUG({
-                flagignore = VM_UNMOD_IMAGE | VM_WAS_FUTURE | VM_ONCE_ONLY | VM_WRITABLE;
+                /* A thread can execute from a mapping before the thread that made
+                 * it has added it here, so that the area being added is already
+                 * there and marked as executed from.
+                 */
+                flagignore = VM_UNMOD_IMAGE | VM_WAS_FUTURE | VM_ONCE_ONLY | VM_WRITABLE |
+                    VM_EXECUTED_FROM;
             });
 #ifdef PROGRAM_SHEPHERDING
             DODEBUG({ flagignore = flagignore | VM_PATTERN_REVERIFY; });

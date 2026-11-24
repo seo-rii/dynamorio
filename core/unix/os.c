@@ -7579,6 +7579,24 @@ pre_system_call(dcontext_t *dcontext)
         }
         pre_mapping_handle_sharedness_change(
             dcontext, addr, len, TESTANY(MAP_FIXED, flags), TESTANY(MAP_SHARED, flags));
+        /* A fixed mapping replaces whatever is mapped there, as an unmap followed by
+         * a map would.  For code we have fragments of, those must go: flush them
+         * now, as for an unmap, and once more after the system call, for fragments
+         * that another thread builds from the old code in between.  We leave a
+         * library's segments alone: they are mapped over its initial mapping before
+         * any of its code runs.
+         */
+        dcontext->sys_param4 = 0;
+        if (addr != NULL && TESTANY(MAP_FIXED, flags) && !image &&
+            executable_vm_area_overlap((app_pc)addr, (app_pc)addr + len,
+                                       false /*no lock*/)) {
+            LOG(THREAD, LOG_SYSCALLS, 2, "\tfixed mmap over code " PFX "-" PFX "\n", addr,
+                (app_pc)addr + len);
+            flush_fragments_and_remove_region(dcontext, (app_pc)addr, len,
+                                              false /* don't own initexit_lock */,
+                                              false /* keep futures */);
+            dcontext->sys_param4 = 1;
+        }
         /* post_system_call does the work */
         dcontext->sys_param0 = (reg_t)addr;
         dcontext->sys_param1 = len;
@@ -9287,6 +9305,15 @@ post_system_call(dcontext_t *dcontext)
             prot = (uint)dcontext->sys_param2;
             flags = (uint)dcontext->sys_param3;
             DEBUG_DECLARE(map_type = IF_X64_ELSE("mmap2", "mmap");)
+            if (dcontext->sys_param4 != 0 &&
+                executable_vm_area_overlap(base, base + size, false /*no lock*/)) {
+                /* See pre_system_call(): another thread ran the old code between
+                 * our flush and the system call, and built fragments from it.
+                 */
+                flush_fragments_and_remove_region(dcontext, base, size,
+                                                  false /* don't own initexit_lock */,
+                                                  false /* keep futures */);
+            }
 #if defined(LINUX) && !defined(X64) && !defined(ARM)
         }
 #endif
