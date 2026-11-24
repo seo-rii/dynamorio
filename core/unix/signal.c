@@ -4868,12 +4868,16 @@ unlink_fragment_of_clean_call(dcontext_t *dcontext, thread_sig_info_t *info, byt
     fragment_t *f;
     /* Only a clean callee runs on the dstack while control is still in the cache.
      * DR code may hold the locks the lookup and unlinking need, and so may a thread
-     * that is linking: their signals keep waiting for d_r_dispatch.
+     * that is linking: their signals keep waiting for d_r_dispatch.  Private
+     * libraries make their system calls through client_int_syscall where it is
+     * their vsyscall (i#555), so a signal from a callee's own system call arrives
+     * there, in DR but holding no lock.
      */
     if ((dcontext->whereami != DR_WHERE_FCACHE &&
          dcontext->whereami != DR_WHERE_CLEAN_CALLEE) ||
         info->interrupted != NULL || !is_on_dstack(dcontext, xsp) ||
-        is_in_dynamo_dll(pc) || is_couldbelinking(dcontext))
+        (is_in_dynamo_dll(pc) && pc != (byte *)client_int_syscall + INT_LENGTH) ||
+        is_couldbelinking(dcontext))
         return;
     /* An inline context switch leaves a stale value or zero here: only take the
      * return address of a call to the save routine.
