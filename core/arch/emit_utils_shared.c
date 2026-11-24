@@ -5862,6 +5862,22 @@ emit_clean_call_save(dcontext_t *dcontext, byte *pc, generated_code_t *code)
     /* save all registers */
     insert_push_all_registers(dcontext, NULL, &ilist, NULL, (uint)PAGE_SIZE,
                               OPND_CREATE_INT32(0), REG_NULL);
+#    ifdef UNIX
+    /* Our return address, below the context we just saved, is the clean call's
+     * address in the code cache.  Copy it to the context's pc slot, which is
+     * otherwise unused, for a signal that interrupts the callee (see
+     * record_pending_signal()).  Neither instruction changes a register or the
+     * flags, and the arguments the caller sets up next may read any register.
+     */
+    APP(&ilist,
+        INSTR_CREATE_push(dcontext,
+                          OPND_CREATE_MEMPTR(DR_REG_XSP,
+                                             -(int)(get_clean_call_temp_stack_size() +
+                                                    XSP_SZ /* return addr */))));
+    APP(&ilist,
+        INSTR_CREATE_pop(dcontext,
+                         OPND_CREATE_MEMPTR(DR_REG_XSP, offsetof(priv_mcontext_t, pc))));
+#    endif
 #elif defined(AARCH64)
     /* save all registers */
     insert_push_all_registers(dcontext, NULL, &ilist, NULL, (uint)PAGE_SIZE,
@@ -5956,6 +5972,13 @@ emit_clean_call_restore(dcontext_t *dcontext, byte *pc, generated_code_t *code)
         INSTR_CREATE_lea(
             dcontext, opnd_create_reg(DR_REG_XSP),
             opnd_create_base_disp(DR_REG_XSP, DR_REG_NULL, 0, (int)XSP_SZ, OPSZ_lea)));
+#    ifdef UNIX
+    /* The callee has returned: clear the address emit_clean_call_save() recorded. */
+    APP(&ilist,
+        XINST_CREATE_store(dcontext,
+                           OPND_CREATE_MEMPTR(DR_REG_XSP, offsetof(priv_mcontext_t, pc)),
+                           OPND_CREATE_INT32(0)));
+#    endif
     /* restore all registers */
     insert_pop_all_registers(dcontext, NULL, &ilist, NULL, (uint)PAGE_SIZE);
     /* return back */

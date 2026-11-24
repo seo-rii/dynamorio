@@ -4833,17 +4833,37 @@ find_next_fragment_from_gencode(dcontext_t *dcontext, sigcontext_t *sc)
     return f;
 }
 
+/* Returns whether pc follows a direct call to the out-of-line clean call save
+ * routine, which is how emit_clean_call_save() records the clean call's address.
+ */
+static bool
+is_clean_call_save_return(dcontext_t *dcontext, cache_pc pc)
+{
+#ifdef X86
+    byte call[5];
+    if (pc == NULL || !in_fcache(pc) ||
+        !d_r_safe_read(pc - sizeof(call), sizeof(call), call))
+        return false;
+    return call[0] == RAW_OPCODE_call &&
+        pc + *(int *)&call[1] == get_clean_call_save(dcontext _IF_X64(GENCODE_X64));
+#else
+    return false;
+#endif
+}
+
 /* A signal that interrupts a clean callee, or code the callee calls, waits for
  * the thread's next exit from the code cache, and a loop of linked fragments may
- * never take one.  Before it switched to the dstack the clean call recorded its own
- * code cache address: unlink that fragment, as for a signal that arrives in the
- * cache, so the thread exits to d_r_dispatch at the fragment's next exit.
+ * never take one.  The out-of-line clean call save recorded the clean call's code
+ * cache address in the pc slot of the context it saved: unlink that fragment, as
+ * for a signal that arrives in the cache, so the thread exits to d_r_dispatch at
+ * the fragment's next exit.  Inline context switches record nothing, so their
+ * callees keep the old behavior.
  */
 static void
 unlink_fragment_of_clean_call(dcontext_t *dcontext, thread_sig_info_t *info, byte *pc,
                               byte *xsp)
 {
-    cache_pc call_pc = dcontext->clean_call_cache_pc;
+    cache_pc call_pc;
     fragment_t wrapper;
     fragment_t *f;
     /* Only a clean callee runs on the dstack while control is still in the cache.
@@ -4852,11 +4872,17 @@ unlink_fragment_of_clean_call(dcontext_t *dcontext, thread_sig_info_t *info, byt
      */
     if ((dcontext->whereami != DR_WHERE_FCACHE &&
          dcontext->whereami != DR_WHERE_CLEAN_CALLEE) ||
-        call_pc == NULL || info->interrupted != NULL || !is_on_dstack(dcontext, xsp) ||
+        info->interrupted != NULL || !is_on_dstack(dcontext, xsp) ||
         is_in_dynamo_dll(pc) || is_couldbelinking(dcontext))
         return;
+    /* An inline context switch leaves a stale value or zero here: only take the
+     * return address of a call to the save routine.
+     */
+    call_pc = get_priv_mcontext_from_dstack(dcontext)->pc;
+    if (!is_clean_call_save_return(dcontext, call_pc))
+        return;
     /* PR 213040: we can't unlink coarse. */
-    if (!in_fcache(call_pc) || get_fcache_coarse_info(call_pc) != NULL)
+    if (get_fcache_coarse_info(call_pc) != NULL)
         return;
     f = fragment_pclookup(dcontext, call_pc, &wrapper);
     if (f == NULL || TESTANY(FRAG_COARSE_GRAIN, f->flags))

@@ -230,18 +230,6 @@ prepare_for_clean_call(dcontext_t *dcontext, clean_call_info_t *cci, instrlist_t
 #else
         PRE(ilist, instr,
             instr_create_save_to_dc_via_reg(dcontext, SCRATCH_REG0, REG_XSP, XSP_OFFSET));
-#    if defined(UNIX) && defined(X86)
-        /* Record where this clean call is in the code cache, for a signal that
-         * interrupts the callee (see record_pending_signal()).  The immediate
-         * stores need no scratch register and leave the flags alone.
-         * XXX: Record it on the other architectures too.
-         */
-        insert_mov_instr_addr(
-            dcontext, start_label, vmcode_get_end(),
-            opnd_create_dcontext_field_via_reg_sz(dcontext, SCRATCH_REG0,
-                                                  CLEAN_CALL_CACHE_PC_OFFSET, OPSZ_PTR),
-            ilist, instr, NULL, NULL);
-#    endif
 #endif
         /* DSTACK_OFFSET isn't within the upcontext so if it's separate this won't
          * work right.  XXX - the dcontext accessing routines are a mess of shared

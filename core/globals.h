@@ -829,11 +829,6 @@ struct _dcontext_t {
      * as that.
      */
     sbyte signals_pending; /* != 0: pending; < 0: currently handling one */
-    /* The code cache address of the last clean call this thread entered, which
-     * the clean call stores before it switches to the dstack (x86 only).  A signal
-     * that interrupts the callee unlinks that fragment to bound its delivery.
-     */
-    cache_pc clean_call_cache_pc;
 #endif
 
     /************* end of offset-crucial fields *********************/

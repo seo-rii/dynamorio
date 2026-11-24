@@ -6787,7 +6787,13 @@ dr_get_mcontext_priv(dcontext_t *dcontext, dr_mcontext_t *dmc, priv_mcontext_t *
     /* XXX: should we set the pc field?
      * If we do we'll have to adopt a different solution for i#1685 in our Windows
      * hooks where today we use the pc slot for temp storage.
+     * The out-of-line clean call save records a code cache address there for the
+     * signal handler: do not report it.
      */
+    if (mc != NULL)
+        mc->pc = NULL;
+    else if (TESTALL(DR_MC_ALL, dmc->flags) && dmc->size == sizeof(dr_mcontext_t))
+        dmc->pc = NULL;
 
     return true;
 }
