@@ -5227,25 +5227,32 @@ fragment_self_write(dcontext_t *dcontext)
         dcontext->last_fragment->tag,
         EXIT_CTI_PC(dcontext->last_fragment, dcontext->last_exit));
     STATS_INC(num_self_writes);
+#ifdef PROGRAM_SHEPHERDING
+    /* we can't call fragment_delete if vm_area_t deletes it by flushing */
+    if (!TESTANY(FRAG_WAS_DELETED, dcontext->last_fragment->flags) &&
+        vm_area_fragment_self_write(dcontext, dcontext->last_fragment->tag))
+        return;
+#endif
+    /* We are nolinking, so a flusher takes us to be at a safe point and can be
+     * unlinking our fragments right now, this one included, which also allocates
+     * from our heap.  It holds our linking lock while it does: we hold it while we
+     * check for that and delete.
+     */
+    per_thread_t *pt = (per_thread_t *)dcontext->fragment_field;
+    d_r_mutex_lock(&pt->linking_lock);
     if (TESTANY(FRAG_WAS_DELETED, dcontext->last_fragment->flags)) {
         /* Case 8177: case 3559 unionized fragment_t.in_xlate, so we cannot delete a
          * fragment that has already been unlinked in the first stage of a flush.
          * The flush queue check, which comes after this (b/c we want to be
          * nolinking), will delete.
          */
-        ASSERT(((per_thread_t *)dcontext->fragment_field)->flush_queue_nonempty);
+        ASSERT(pt->flush_queue_nonempty);
         STATS_INC(num_self_writes_after_flushes);
     } else {
-#ifdef PROGRAM_SHEPHERDING
-        /* we can't call fragment_delete if vm_area_t deletes it by flushing */
-        if (!vm_area_fragment_self_write(dcontext, dcontext->last_fragment->tag)) {
-#endif
-            fragment_delete(dcontext, dcontext->last_fragment, FRAGDEL_ALL);
-            STATS_INC(num_fragments_deleted_selfmod);
-#ifdef PROGRAM_SHEPHERDING
-        }
-#endif
+        fragment_delete(dcontext, dcontext->last_fragment, FRAGDEL_ALL);
+        STATS_INC(num_fragments_deleted_selfmod);
     }
+    d_r_mutex_unlock(&pt->linking_lock);
 }
 
 /* coarse_grain says to use just the min_pc and max_pc of f.
