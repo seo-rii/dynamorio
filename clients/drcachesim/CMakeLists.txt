@@ -960,6 +960,7 @@ if (BUILD_TESTS)
   if (UNIX)
     add_executable(tool.drcachesim.ipc_reader_unit_tests tests/ipc_reader_unit_tests.cpp
       reader/ipc_reader.cpp common/named_pipe_${os_name}.cpp)
+    add_win32_flags(tool.drcachesim.ipc_reader_unit_tests ON)
     target_link_libraries(tool.drcachesim.ipc_reader_unit_tests drmemtrace_analyzer
       test_helpers)
     add_test(NAME tool.drcachesim.ipc_reader_unit_tests
