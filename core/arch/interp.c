@@ -2899,7 +2899,7 @@ bb_build_selfmod_snapshot(dcontext_t *dcontext, app_pc tag, size_t *size)
         bb->selfmod_snapshot_failed || !TESTANY(FRAG_SELFMOD_SANDBOXED, bb->flags))
         return NULL;
     if (bb->end_pc <= bb->start_pc ||
-        bb->end_pc - bb->start_pc > bb->selfmod_snapshot_len) {
+        (size_t)(bb->end_pc - bb->start_pc) > bb->selfmod_snapshot_len) {
         /* We decode every instruction of the block from the snapshot. */
         ASSERT_NOT_REACHED();
         return NULL;
