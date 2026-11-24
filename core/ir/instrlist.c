@@ -479,8 +479,14 @@ instrlist_clone(void *drcontext, instrlist_t *old)
             if (opnd_is_far_instr(op)) {
                 instr_set_src(copy, i,
                               opnd_create_far_instr(opnd_get_segment_selector(op), tgt));
-            } else
-                instr_set_src(copy, i, opnd_create_instr(tgt));
+            } else {
+                /* Keep the size and shift: insert_mov_instr_addr() stores a 64-bit
+                 * address as two 32-bit halves of the same instr.
+                 */
+                instr_set_src(
+                    copy, i,
+                    opnd_create_instr_ex(tgt, opnd_get_size(op), opnd_get_shift(op)));
+            }
         }
     }
     for (inst = instrlist_first(old), copy = instrlist_first(newlist);
