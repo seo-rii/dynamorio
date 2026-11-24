@@ -5418,11 +5418,11 @@ recreate_fragment_ilist(dcontext_t *dcontext, byte *pc,
         for (i = 0; i < t->num_bbs; i++) {
             void *vmlist = NULL;
             apc = (byte *)t->bbs[i].tag;
-            bb = recreate_bb_ilist(
-                dcontext, apc, apc, NULL /*default stop*/, 0 /*no pre flags*/, &flags,
-                &md.final_exit_flags, check_vm_area, !mangle_at_end,
-                (mangle_at_end && check_vm_area ? &vmlist : NULL), call_client,
-                true /*for_trace*/);
+            bb = recreate_bb_ilist(dcontext, apc, apc, NULL /*default stop*/,
+                                   0 /*no pre flags*/, &flags, &md.final_exit_flags,
+                                   check_vm_area, !mangle_at_end,
+                                   (mangle_at_end && check_vm_area ? &vmlist : NULL),
+                                   call_client, true /*for_trace*/);
             ASSERT(bb != NULL);
             if (bb == NULL) {
                 instrlist_clear_and_destroy(dcontext, ilist);
