@@ -957,6 +957,17 @@ if (BUILD_TESTS)
   set_tests_properties(tool.drcacheoff.flexible_queue_tests PROPERTIES TIMEOUT
     ${test_seconds})
 
+  if (UNIX)
+    add_executable(tool.drcachesim.ipc_reader_unit_tests tests/ipc_reader_unit_tests.cpp
+      reader/ipc_reader.cpp common/named_pipe_${os_name}.cpp)
+    target_link_libraries(tool.drcachesim.ipc_reader_unit_tests drmemtrace_analyzer
+      test_helpers)
+    add_test(NAME tool.drcachesim.ipc_reader_unit_tests
+      COMMAND tool.drcachesim.ipc_reader_unit_tests)
+    set_tests_properties(tool.drcachesim.ipc_reader_unit_tests PROPERTIES TIMEOUT
+      ${test_seconds})
+  endif ()
+
   add_executable(tool.drcachesim.core_sharded tests/core_sharded_test.cpp
     # XXX: Better to put these into libraries but that requires a bigger cleanup:
     analyzer_multi.cpp ${client_and_sim_srcs} reader/ipc_reader.cpp
