@@ -6255,6 +6255,13 @@ if (UNIX)
       set_avx_flags(linux.synchall-restore)
       link_with_pthread(linux.synchall-restore)
     endif ()
+    if (X86 AND X64)
+      # A fault in a block of generated code that a write to its page has just
+      # flushed, as at a JIT's safepoint poll.
+      tobuild_ops(linux.selfmod-fault linux/selfmod-fault.c
+        "-ro2sandbox_threshold 1 -sandbox2ro_threshold 2" "")
+      link_with_pthread(linux.selfmod-fault)
+    endif ()
 
     if (NOT ANDROID)
       tobuild(linux.threadexit2 linux/threadexit2.c) # XXX i#1874: hangs on Android
