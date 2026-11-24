@@ -240,6 +240,8 @@ mixed_mode_enabled(void)
         ((PROT_OFFS) + offsetof(dcontext_t, nonswapped_scratch))
 #else
 #    define SIGPENDING_OFFSET ((PROT_OFFS) + offsetof(dcontext_t, signals_pending))
+#    define CLEAN_CALL_CACHE_PC_OFFSET \
+        ((PROT_OFFS) + offsetof(dcontext_t, clean_call_cache_pc))
 #endif
 
 #ifdef TRACE_HEAD_CACHE_INCR

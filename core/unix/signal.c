@@ -4833,6 +4833,42 @@ find_next_fragment_from_gencode(dcontext_t *dcontext, sigcontext_t *sc)
     return f;
 }
 
+/* A signal that interrupts a clean callee, or code the callee calls, waits for
+ * the thread's next exit from the code cache, and a loop of linked fragments may
+ * never take one.  Before it switched to the dstack the clean call recorded its own
+ * code cache address: unlink that fragment, as for a signal that arrives in the
+ * cache, so the thread exits to d_r_dispatch at the fragment's next exit.
+ */
+static void
+unlink_fragment_of_clean_call(dcontext_t *dcontext, thread_sig_info_t *info, byte *pc,
+                              byte *xsp)
+{
+    cache_pc call_pc = dcontext->clean_call_cache_pc;
+    fragment_t wrapper;
+    fragment_t *f;
+    /* Only a clean callee runs on the dstack while control is still in the cache.
+     * DR code may hold the locks the lookup and unlinking need, and so may a thread
+     * that is linking: their signals keep waiting for d_r_dispatch.
+     */
+    if ((dcontext->whereami != DR_WHERE_FCACHE &&
+         dcontext->whereami != DR_WHERE_CLEAN_CALLEE) ||
+        call_pc == NULL || info->interrupted != NULL || !is_on_dstack(dcontext, xsp) ||
+        is_in_dynamo_dll(pc) || is_couldbelinking(dcontext))
+        return;
+    /* PR 213040: we can't unlink coarse. */
+    if (!in_fcache(call_pc) || get_fcache_coarse_info(call_pc) != NULL)
+        return;
+    f = fragment_pclookup(dcontext, call_pc, &wrapper);
+    if (f == NULL || TESTANY(FRAG_COARSE_GRAIN, f->flags))
+        return;
+    LOG(THREAD, LOG_ASYNCH, 2, "\tsignal in clean callee: delaying until exit F%d\n",
+        f->id);
+    if (unlink_fragment_for_signal(dcontext, f, call_pc)) {
+        info->interrupted = f;
+        info->interrupted_pc = call_pc;
+    }
+}
+
 static void
 record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
                       sigframe_rt_t *frame, bool forged, byte *access_address)
@@ -5136,6 +5172,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
             abort_on_DR_fault(dcontext, pc, NULL, sig, frame,
                               (sig == SIGSEGV) ? "SEGV" : "other", " unknown");
         }
+        unlink_fragment_of_clean_call(dcontext, info, pc, xsp);
     }
 
     LOG(THREAD, LOG_ASYNCH, 3, "\taction is not SIG_IGN\n");
