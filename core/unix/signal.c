@@ -5268,7 +5268,20 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
         /* Happened in DR, do not translate context.  Record for later processing
          * at a safe point with a clean app state.
          */
-        if (!blocked || sig >= OFFS_RT || (blocked && info->sigpending[sig] == NULL)) {
+        /* Queueing a signal when the pending-signal heap's first unit is full
+         * allocates a new unit, which is unsafe here: it acquires locks that the
+         * code we interrupted may hold.  When only one block is left we do not
+         * queue a standard signal that is already pending, which the kernel does
+         * not queue again either, and keep the block for a signal that is not.
+         */
+        bool keep_last_block = sig < OFFS_RT && info->sigpending[sig] != NULL &&
+            info->num_pending + 1 >= (int)DYNAMO_OPTION(max_pending_signals);
+        if (keep_last_block) {
+            STATS_INC(num_signals_dropped);
+            SYSLOG_INTERNAL_WARNING_ONCE("dropping already-pending standard signal");
+        }
+        if (!keep_last_block &&
+            (!blocked || sig >= OFFS_RT || (blocked && info->sigpending[sig] == NULL))) {
             /* only have 1 pending for blocked non-rt signals */
 
             /* To avoid accumulating signals if we're slow in presence of
