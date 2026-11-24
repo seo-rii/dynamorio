@@ -625,6 +625,15 @@ bool
 app_memory_pre_alloc(dcontext_t *dcontext, byte *base, size_t size, uint prot, bool hint,
                      bool update_areas, bool image);
 
+void
+app_memory_protection_change_start(dcontext_t *dcontext, app_pc base, size_t size,
+                                   uint old_prot, uint prot /* MEMPROT_ */);
+
+void
+app_memory_protection_change_done(dcontext_t *dcontext, app_pc base, size_t size,
+                                  uint prot /* platform independent MEMPROT_ */,
+                                  bool success);
+
 uint
 app_memory_protection_change(dcontext_t *dcontext, app_pc base, size_t size,
                              uint prot,         /* platform independent MEMPROT_ */
