@@ -6256,6 +6256,12 @@ if (UNIX)
       link_with_pthread(linux.synchall-restore)
     endif ()
 
+    if (X86) # The test generates x86 code.
+      tobuild_ops(linux.selfmod-patch-race linux/selfmod-patch-race.c
+        "-sandbox_writable" "")
+      link_with_pthread(linux.selfmod-patch-race)
+    endif ()
+
     if (NOT ANDROID)
       tobuild(linux.threadexit2 linux/threadexit2.c) # XXX i#1874: hangs on Android
       tobuild(linux.signalfd linux/signalfd.c) # XXX i#1874: fails natively on Android
