@@ -2926,6 +2926,14 @@ if (X86 OR AARCH64 OR RISCV64) # XXX i#1551: port asm to ARM
     tobuild_ci(client.flush client-interface/flush.c "" "" "")
   endif ()
 endif (X86 OR AARCH64 OR RISCV64)
+if (X86 AND X64 AND LINUX) # The test generates x86-64 code.
+  # A fault in a trace that a write to its page has just flushed, translated with
+  # a client.  Page protection, not sandboxing, keeps the code consistent here:
+  # sandboxed blocks do not become traces.
+  tobuild_ci(client.selfmod-fault-trace client-interface/selfmod-fault-trace.c ""
+    "-ro2sandbox_threshold 0" "")
+  link_with_pthread(client.selfmod-fault-trace)
+endif ()
 if (X86 OR AARCH64) # XXX i#1551: port asm to ARM
   tobuild_ci(client.strace client-interface/strace.c "" "" "")
   use_DynamoRIO_extension(client.strace.dll drmgr)

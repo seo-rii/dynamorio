@@ -99,6 +99,21 @@ patcher(void *arg)
 int
 main(void)
 {
+#ifdef POLL_IN_LOOP
+    /* Copy one byte per iteration and poll in each: the loop becomes a trace, so
+     * most faults are in traces.
+     */
+    static const unsigned char body[] = {
+        0x49, 0x89, 0xc8, /* mov r8, rcx */
+        0x48, 0x89, 0xd1, /* mov rcx, rdx */
+        0xa4,             /* loop: movsb */
+        0x41, 0x85, 0x00, /* test [r8], eax: the poll */
+        0x48, 0xff, 0xc9, /* dec rcx */
+        0x75, 0xf7,       /* jnz loop */
+        0xc3,             /* ret */
+    };
+#    define POLL_OFFSET 7
+#else
     static const unsigned char body[] = {
         0x49, 0x89, 0xc8, /* mov r8, rcx */
         0x48, 0x89, 0xd1, /* mov rcx, rdx */
@@ -106,6 +121,8 @@ main(void)
         0x41, 0x85, 0x00, /* test [r8], eax: the poll */
         0xc3,             /* ret */
     };
+#    define POLL_OFFSET 8
+#endif
     code = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     poll_page =
@@ -115,7 +132,7 @@ main(void)
         return 1;
     }
     memcpy(code, body, sizeof(body));
-    poll_pc = code + 8;
+    poll_pc = code + POLL_OFFSET;
     intercept_signal(SIGSEGV, (handler_3_t)handler, false);
     unsigned char *src = calloc(1, COPY_BYTES), *dst = calloc(1, COPY_BYTES);
     pthread_t thread;

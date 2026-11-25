@@ -6966,9 +6966,11 @@ mangle_trace(dcontext_t *dcontext, instrlist_t *ilist, monitor_data_t *md)
 
         /* Clients should not add new source code regions, which would mess us up
          * here, as well as mess up our cache consistency (both page prot and
-         * selfmod).
+         * selfmod).  A flushed trace is recreated without consulting its regions
+         * (see recreate_fragment_ilist()), so its blocks have no region list to
+         * check: the check was made when the trace was built.
          */
-        if (md->pass_to_client &&
+        if (md->pass_to_client && md->blk_info[blk].vmlist != NULL &&
             (!vm_list_overlaps(dcontext, md->blk_info[blk].vmlist, xl8, xl8 + 1) &&
              !(instr_is_ubr(inst) && opnd_is_pc(instr_get_target(inst)) &&
                xl8 == opnd_get_pc(instr_get_target(inst))))
