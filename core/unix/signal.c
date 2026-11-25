@@ -4480,8 +4480,14 @@ unlink_fragment_for_signal(dcontext_t *dcontext, fragment_t *f,
      */
     bool changed = false;
     bool waslinking = is_couldbelinking(dcontext);
+    /* The thread resumes f without passing d_r_dispatch, so we must not go through
+     * enter_couldbelinking() and enter_nolinking() here: they act on the thread's
+     * flush queue, which can delete f, or release the thread's reference to f if f
+     * is a shared fragment that is pending deletion, and the thread would then
+     * resume freed code.
+     */
     if (!waslinking)
-        enter_couldbelinking(dcontext, NULL, false);
+        acquire_linking_lock_in_fragment(dcontext);
     /* may not be linked if trace_relink or something */
     if (TESTANY(FRAG_COARSE_GRAIN, f->flags)) {
         /* XXX PR 213040: we don't support unlinking coarse, so we try
@@ -4520,13 +4526,47 @@ unlink_fragment_for_signal(dcontext_t *dcontext, fragment_t *f,
             changed = true;
     }
     if (!waslinking)
-        enter_nolinking(dcontext, NULL, false);
+        release_linking_lock_in_fragment(dcontext);
     return changed;
+}
+
+/* A fragment that we unlinked for a signal can be flushed before we re-link it.
+ * It is not entered again, so there is nothing to restore, and it can be freed
+ * once this thread acts on its flush queue: the thread drops its pointer first.
+ */
+void
+signal_forget_flushed_fragment(dcontext_t *dcontext)
+{
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    if (info != NULL && info->interrupted != NULL &&
+        TESTANY(FRAG_WAS_DELETED, info->interrupted->flags)) {
+        LOG(THREAD, LOG_ASYNCH, 3, "\tinterrupted F%d was flushed: not re-linking\n",
+            info->interrupted->id);
+        info->interrupted = NULL;
+        info->interrupted_pc = NULL;
+    }
+}
+
+/* The thread itself can also delete the fragment we unlinked for a signal,
+ * without a flush: a sandboxed block that wrote to its own code, for example
+ * (fragment_self_write()).  Called from fragment_delete().
+ */
+void
+signal_forget_deleted_fragment(dcontext_t *dcontext, fragment_t *f)
+{
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    if (info != NULL && info->interrupted == f) {
+        LOG(THREAD, LOG_ASYNCH, 3, "\tinterrupted F%d is deleted: not re-linking\n",
+            f->id);
+        info->interrupted = NULL;
+        info->interrupted_pc = NULL;
+    }
 }
 
 static void
 relink_interrupted_fragment(dcontext_t *dcontext, thread_sig_info_t *info)
 {
+    signal_forget_flushed_fragment(dcontext);
     if (info->interrupted == NULL)
         return;
     /* i#2066: if we were building a trace, it may already be re-linked */

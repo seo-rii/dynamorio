@@ -519,6 +519,10 @@ kernel_sigismember(kernel_sigset_t *set, int _sig)
 
 void
 receive_pending_signal(dcontext_t *dcontext);
+void
+signal_forget_flushed_fragment(dcontext_t *dcontext);
+void
+signal_forget_deleted_fragment(dcontext_t *dcontext, fragment_t *f);
 bool
 is_signal_restorer_code(byte *pc, size_t *len);
 bool

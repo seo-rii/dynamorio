@@ -6269,6 +6269,10 @@ if (UNIX)
       tobuild_ops(linux.ibl-delete-race linux/ibl-delete-race.c
         "-disable_traces -slowdown_ibl_found 20000" "")
       link_with_pthread(linux.ibl-delete-race)
+      # The test sends signals faster than a debug build delivers them.
+      tobuild_ops(linux.signal-flush-race linux/signal-flush-race.c
+        "-max_pending_signals 64" "")
+      link_with_pthread(linux.signal-flush-race)
     endif ()
 
     # The race is detected by a consistency check in debug builds.

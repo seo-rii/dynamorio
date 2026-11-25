@@ -2968,6 +2968,11 @@ fragment_delete(dcontext_t *dcontext, fragment_t *f, uint actions)
 {
     bool acquired_shared_vm_lock = false;
     bool acquired_fragdel_lock = false;
+#ifdef UNIX
+    /* The signal handler may hold f to re-link it when the signal is delivered. */
+    if (dcontext != GLOBAL_DCONTEXT)
+        signal_forget_deleted_fragment(dcontext, f);
+#endif
     LOG(THREAD, LOG_FRAGMENT, 3,
         "fragment_delete: *" PFX " F%d(" PFX ")." PFX " %s 0x%x\n", f, f->id, f->tag,
         f->start_pc, TESTANY(FRAG_IS_TRACE, f->flags) ? "trace" : "bb", actions);
@@ -5429,6 +5434,10 @@ check_flush_queue(dcontext_t *dcontext, fragment_t *was_I_flushed)
     per_thread_t *pt = (per_thread_t *)dcontext->fragment_field;
     bool not_flushed = true;
     ASSERT_OWN_MUTEX(true, &pt->linking_lock);
+#ifdef UNIX
+    /* We are about to free flushed fragments, or to give up our claim on them. */
+    signal_forget_flushed_fragment(dcontext);
+#endif
     /* first check private queue and act on pending deletions */
     if (pt->flush_queue_nonempty) {
         bool local_prot = local_heap_protected(dcontext);
@@ -5766,6 +5775,33 @@ enter_nolinking(dcontext_t *dcontext, fragment_t *was_I_flushed, bool cache_tran
     }
 
     return not_flushed;
+}
+
+/* For a thread that changes the links of a fragment it has not left, such as
+ * from a signal handler that interrupted the code cache.  A flusher holds this
+ * lock while it unlinks our fragments, so holding it keeps the two apart.
+ * Such a thread must not use enter_couldbelinking() and enter_nolinking()
+ * instead: those are synch points for flushing, which delete the fragments on
+ * the thread's flush queue and release its references to pending shared
+ * deletions, and the thread may be about to resume one of those fragments.
+ */
+void
+acquire_linking_lock_in_fragment(dcontext_t *dcontext)
+{
+    per_thread_t *pt = (per_thread_t *)dcontext->fragment_field;
+    if (RUNNING_WITHOUT_CODE_CACHE() /*case 7966: has no pt*/ || pt == NULL)
+        return;
+    d_r_mutex_lock(&pt->linking_lock);
+    ASSERT(!pt->could_be_linking);
+}
+
+void
+release_linking_lock_in_fragment(dcontext_t *dcontext)
+{
+    per_thread_t *pt = (per_thread_t *)dcontext->fragment_field;
+    if (RUNNING_WITHOUT_CODE_CACHE() /*case 7966: has no pt*/ || pt == NULL)
+        return;
+    d_r_mutex_unlock(&pt->linking_lock);
 }
 
 /* Returns false iff was_I_flushed ends up being deleted */
