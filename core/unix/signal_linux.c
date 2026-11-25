@@ -570,6 +570,10 @@ void
 signal_handle_close_range(dcontext_t *dcontext, uint first, uint last)
 {
     TABLE_RWLOCK(sigfd_table, write, lock);
-    generic_hash_range_remove(GLOBAL_DCONTEXT, sigfd_table, first, (ptr_uint_t)last + 1);
+    /* The range end is exclusive, and last + 1 wraps to 0 for last == UINT_MAX
+     * where a pointer is 32 bits: remove last separately.
+     */
+    generic_hash_range_remove(GLOBAL_DCONTEXT, sigfd_table, first, last);
+    generic_hash_remove(GLOBAL_DCONTEXT, sigfd_table, last);
     TABLE_RWLOCK(sigfd_table, write, unlock);
 }
