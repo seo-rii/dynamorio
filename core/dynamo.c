@@ -1261,7 +1261,8 @@ synch_with_threads_at_exit(thread_synch_state_t synch_res, bool pre_exit)
 {
     int num_threads;
     thread_record_t **threads;
-    DEBUG_DECLARE(bool ok;)
+    dcontext_t *dcontext = get_thread_private_dcontext();
+    int expected_exiting = dcontext != NULL && dcontext->is_exiting ? 1 : 0;
     /* If we fail to suspend a thread (e.g., privilege
      * problems) ignore it. XXX: retry instead?
      */
@@ -1293,14 +1294,23 @@ synch_with_threads_at_exit(thread_synch_state_t synch_res, bool pre_exit)
      * loop to a stack-free loop (xref i#95).
      */
     IF_UNIX(dynamo_exiting = true;) /* include execve-exited vfork threads */
-    DEBUG_DECLARE(ok =)
-    synch_with_all_threads(synch_res, &threads, &num_threads,
-                           /* Case 6821: other synch-all-thread uses that
-                            * only care about threads carrying fcache
-                            * state can ignore us
-                            */
-                           THREAD_SYNCH_NO_LOCKS_NO_XFER, flags);
-    ASSERT(ok);
+    bool stopped =
+        synch_with_all_threads(synch_res, &threads, &num_threads,
+                               /* Case 6821: other synch-all-thread uses that only care
+                                * about threads carrying fcache state can ignore us. */
+                               THREAD_SYNCH_NO_LOCKS_NO_XFER, flags);
+    /* A bounded synchronization attempt can give up.  Never run client exit
+     * events or free TLS and cache state while a thread can still execute code
+     * cache code.  The helper holds thread_initexit_lock here; also require
+     * in-flight thread exits and initializations to have reached its barrier.
+     * Terminate without cleanup: retrying the exit events would be unsafe.
+     * Failing to suspend a thread that has already exited stays ignored.
+     */
+    if (!stopped || exiting_thread_count != expected_exiting ||
+        uninit_thread_count != 0) {
+        REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_SYNCHRONIZE_THREADS, 2,
+                                    get_application_name(), get_application_pid());
+    }
     ASSERT(threads == NULL && num_threads == 0); /* We asked for CLEANED */
     /* the synch_with_all_threads function grabbed the
      * thread_initexit_lock for us! */

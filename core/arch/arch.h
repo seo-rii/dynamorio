@@ -837,10 +837,21 @@ enum {
     DCONTEXT_BASE_SPILL_SLOT = TLS_REG3_SLOT,
 #endif
     PREFIX_XAX_SPILL_SLOT = TLS_REG0_SLOT,
+#ifdef X86
+    /* The tag of an IBL hit, kept from the hit path for target_delete.  It
+     * overlaps with DCONTEXT_BASE_SPILL_SLOT: the hit path restores %xdi first.
+     */
+    IBL_HIT_TAG_SLOT = TLS_REG3_SLOT,
+#endif
 #ifdef HASHTABLE_STATISTICS
     HTABLE_STATS_SPILL_SLOT = TLS_HTABLE_STATS_SLOT,
 #endif
 };
+
+#ifdef X86
+/* IBL_HIT_TAG_SLOT for IBL routines that address the dcontext directly. */
+#    define IBL_HIT_TAG_OFFS SCRATCH_REG3_OFFS
+#endif
 
 /* A simple linker to give us indirection for patching after relocating structures */
 typedef struct patch_entry_t {

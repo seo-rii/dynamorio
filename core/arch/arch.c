@@ -266,9 +266,11 @@ move_to_start_of_cache_line(dr_isa_mode_t isa_mode, byte *pc)
 /* The real size of generated code we need varies by cache line size and
  * options like inlining of ibl code.  We also generate different routines
  * for thread-private and thread-shared.  So, we dynamically extend the size
- * as we generate.  Currently our max is under 5 pages.
+ * as we generate.  Currently our max is under 6 pages: with -coarse_units
+ * on a host with AVX-512, keeping the tag of an IBL hit for target_delete
+ * takes a little more than 5.
  */
-#define GENCODE_RESERVE_SIZE (5 * PAGE_SIZE)
+#define GENCODE_RESERVE_SIZE (6 * PAGE_SIZE)
 
 #define GENCODE_COMMIT_SIZE \
     ((size_t)(ALIGN_FORWARD(sizeof(generated_code_t), PAGE_SIZE) + PAGE_SIZE))
@@ -1529,8 +1531,20 @@ protect_generated_code(generated_code_t *code_in, bool writable)
             code->writable = writable;
         }
         STATS_INC(gencode_prot_changes);
-        change_protection(vmcode_get_writable_addr(genstart),
-                          code->commit_end_pc - genstart, writable);
+#ifdef UNIX
+        /* We know the protection of our own generated code, so we do not use
+         * change_protection(): it first queries the current protection, which on
+         * Linux reads /proc/self/maps.  Each flush gets here four times, via
+         * unlink_special_ibl_xfer() and link_special_ibl_xfer().  With
+         * -satisfy_w_xor_x the change is to the separate writable view instead.
+         */
+        if (!DYNAMO_OPTION(satisfy_w_xor_x)) {
+            set_protection(genstart, code->commit_end_pc - genstart,
+                           MEMPROT_READ | MEMPROT_EXEC | (writable ? MEMPROT_WRITE : 0));
+        } else
+#endif
+            change_protection(vmcode_get_writable_addr(genstart),
+                              code->commit_end_pc - genstart, writable);
         if (writable) {
             ASSERT(!code->writable);
             code->writable = writable;

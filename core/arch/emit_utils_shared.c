@@ -3159,6 +3159,8 @@ append_ibl_found(dcontext_t *dcontext, instrlist_t *ilist, ibl_code_t *ibl_code,
 {
     bool absolute = !ibl_code->thread_shared_routine;
     bool target_prefix = true;
+    /* If TLS doesn't hold table info, XDI was used for indirection. */
+    bool restore_xdi = only_spill_state_in_tls;
     /* eflags and xcx are restored in the target's prefix */
     /* if thread private routine */
     /*>>>    RESTORE_FROM_UPCONTEXT xbx_OFFSET,%xbx                  */
@@ -3201,6 +3203,29 @@ append_ibl_found(dcontext_t *dcontext, instrlist_t *ilist, ibl_code_t *ibl_code,
             APP(ilist, RESTORE_FROM_TLS(dcontext, SCRATCH_REG5, HTABLE_STATS_SPILL_SLOT));
     }
 #endif /* HASHTABLE_STATISTICS */
+
+#ifdef X86
+    if (target_prefix) {
+        /* The target_delete path needs the tag, and it cannot reload it from the
+         * table entry: a racing fragment_prepare_for_removal_from_table()
+         * redirects the entry's start_pc to target_delete and then overwrites its
+         * tag with FAKE_TAG, so a lookup that matched the tag and then read the
+         * redirected start_pc would reload FAKE_TAG and send the app there.
+         * We keep a copy of the tag instead, as below for the no-prefix case:
+         *     <save    %xbx to IBL_HIT_TAG slot>
+         * The slot is the xdx one, which is free here: the miss path uses it as
+         * scratch.  If it holds %xdi, restore %xdi first.
+         */
+        if (restore_xdi) {
+            insert_shared_restore_dcontext_reg(dcontext, ilist, NULL);
+            restore_xdi = false;
+        }
+        if (absolute)
+            APP(ilist, SAVE_TO_DC(dcontext, SCRATCH_REG1, IBL_HIT_TAG_OFFS));
+        else
+            APP(ilist, SAVE_TO_TLS(dcontext, SCRATCH_REG1, IBL_HIT_TAG_SLOT));
+    }
+#endif
 
 #ifdef INTERNAL
     if (INTERNAL_OPTION(slowdown_ibl_found)) {
@@ -3245,7 +3270,7 @@ append_ibl_found(dcontext_t *dcontext, instrlist_t *ilist, ibl_code_t *ibl_code,
                 ASSERT(only_spill_state_in_tls);
         });
     }
-    if (only_spill_state_in_tls) {
+    if (restore_xdi) {
         /* If TLS doesn't hold table info, XDI was used for indirection.
          * Restore XDI through DCONTEXT_BASE_SPILL_SLOT */
         insert_shared_restore_dcontext_reg(dcontext, ilist, NULL);
