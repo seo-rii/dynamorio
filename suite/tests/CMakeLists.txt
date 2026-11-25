@@ -6271,6 +6271,12 @@ if (UNIX)
       link_with_pthread(linux.ibl-delete-race)
     endif ()
 
+    # The race is detected by a consistency check in debug builds.
+    if (X86 AND DEBUG) # The test generates x86 code.
+      tobuild(linux.mprotect-code-race linux/mprotect-code-race.c)
+      link_with_pthread(linux.mprotect-code-race)
+    endif ()
+
     if (NOT ANDROID)
       tobuild(linux.threadexit2 linux/threadexit2.c) # XXX i#1874: hangs on Android
       tobuild(linux.signalfd linux/signalfd.c) # XXX i#1874: fails natively on Android

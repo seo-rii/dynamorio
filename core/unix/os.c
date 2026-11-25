@@ -7741,9 +7741,13 @@ pre_system_call(dcontext_t *dcontext)
         new_memprot = osprot_to_memprot(prot) |
             /* mprotect won't change meta flags */
             (old_memprot & MEMPROT_META_FLAGS);
+        /* Paired with app_memory_protection_change_done() in post_system_call(). */
+        app_memory_protection_change_start(dcontext, addr, len, old_memprot, new_memprot);
         res = app_memory_protection_change(dcontext, addr, len, new_memprot, &new_memprot,
                                            NULL, false /*!image*/);
         if (res != DO_APP_MEM_PROT_CHANGE) {
+            app_memory_protection_change_done(dcontext, addr, len, new_memprot,
+                                              false /*!success*/);
             if (res == FAIL_APP_MEM_PROT_CHANGE) {
                 ASSERT_NOT_IMPLEMENTED(false); /* return code? */
             } else {
@@ -9399,6 +9403,8 @@ post_system_call(dcontext_t *dcontext)
         base = (app_pc)dcontext->sys_param0;
         size = dcontext->sys_param1;
         prot = dcontext->sys_param2;
+        app_memory_protection_change_done(dcontext, base, size, osprot_to_memprot(prot),
+                                          success);
 #ifdef VMX86_SERVER
         /* PR 475111: workaround for PR 107872 */
         if (os_in_vmkernel_userworld() && result == -EBUSY && prot == PROT_NONE) {

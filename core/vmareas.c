@@ -284,6 +284,12 @@ static vm_area_vector_t *pretend_writable_areas;
 /* used for DYNAMO_OPTION(patch_proof_list) areas to watch */
 vm_area_vector_t *patch_proof_areas;
 
+/* Code ranges whose protection a thread is changing, from before the system call
+ * until after it (see app_memory_protection_change_start()).  The data of each
+ * entry is the new MEMPROT_ protection.  Protected by the executable_areas lock.
+ */
+static vm_area_vector_t *pending_protection_changes;
+
 /* used for DYNAMO_OPTION(emulate_IAT_writes), though in future may be
  * expanded, so not just ifdef WINDOWS or ifdef PROGRAM_SHEPHERDING
  */
@@ -1638,6 +1644,9 @@ vm_areas_init(void)
                           pretend_writable_areas);
     VMVECTOR_ALLOC_VECTOR(patch_proof_areas, GLOBAL_DCONTEXT, VECTOR_SHARED,
                           patch_proof_areas);
+    VMVECTOR_ALLOC_VECTOR(pending_protection_changes, GLOBAL_DCONTEXT,
+                          VECTOR_SHARED | VECTOR_NO_LOCK | VECTOR_NEVER_MERGE,
+                          innermost_lock);
     VMVECTOR_ALLOC_VECTOR(emulate_write_areas, GLOBAL_DCONTEXT, VECTOR_SHARED,
                           emulate_write_areas);
     VMVECTOR_ALLOC_VECTOR(IAT_areas, GLOBAL_DCONTEXT, VECTOR_SHARED, IAT_areas);
@@ -1813,6 +1822,8 @@ vm_areas_exit(void)
     pretend_writable_areas = NULL;
     vmvector_delete_vector(GLOBAL_DCONTEXT, patch_proof_areas);
     patch_proof_areas = NULL;
+    vmvector_delete_vector(GLOBAL_DCONTEXT, pending_protection_changes);
+    pending_protection_changes = NULL;
     vmvector_delete_vector(GLOBAL_DCONTEXT, emulate_write_areas);
     emulate_write_areas = NULL;
 
@@ -6455,6 +6466,27 @@ add_executable_vm_areas_for_protection_change(app_pc base, size_t size, uint vm_
      */
     app_pc region_start = base;
     app_pc end = base + size;
+    /* add_executable_vm_area() must take the lock itself for a coarse-grain area,
+     * which is for a module's code: it checks the IAT and persisted caches, and the
+     * hotp lock ranks before ours.
+     */
+    bool hold_lock = !TESTANY(FRAG_COARSE_GRAIN, frag_flags);
+    if (hold_lock) {
+        d_r_write_lock(&executable_areas->lock);
+        /* We checked for executable areas without the lock, before deciding to add
+         * these.  Another thread can have executed the code since and added an area
+         * for it, with the old or the pending protection (see
+         * app_memory_protection_change_start()).  We leave that in place, and the
+         * rest of the region is added when it is executed.
+         */
+        if (executable_vm_area_overlap(base, end, true /*have writelock*/)) {
+            LOG(GLOBAL, LOG_VMAREAS, 2,
+                "\tnot adding " PFX "-" PFX ": another thread added an area in it\n",
+                base, end);
+            d_r_write_unlock(&executable_areas->lock);
+            return;
+        }
+    }
     while (region_start < end) {
         app_pc region_end = end;
         uint region_vm_flags = vm_flags;
@@ -6477,9 +6509,11 @@ add_executable_vm_areas_for_protection_change(app_pc base, size_t size, uint vm_
             }
         }
         add_executable_vm_area(region_start, region_end, region_vm_flags,
-                               region_frag_flags, false /*no lock*/ _IF_DEBUG(comment));
+                               region_frag_flags, hold_lock _IF_DEBUG(comment));
         region_start = region_end;
     }
+    if (hold_lock)
+        d_r_write_unlock(&executable_areas->lock);
 }
 
 /* Called when memory region base:base+size is about to have privileges prot.
@@ -7221,6 +7255,171 @@ app_memory_protection_change_internal(dcontext_t *dcontext, bool update_areas,
             jitopt_clear_span(base, base + size);
     }
     return DO_APP_MEM_PROT_CHANGE; /* let syscall go through */
+}
+
+/* Returns whether a protection change is pending for code in [start, end), and in
+ * *to_writable whether one makes it writable.  Caller must hold the
+ * executable_areas lock.
+ */
+static bool
+pending_protection_change(app_pc start, app_pc end, bool *to_writable /* OUT */)
+{
+    vmvector_iterator_t vmvi;
+    bool found = false;
+    *to_writable = false;
+    if (vmvector_empty(pending_protection_changes))
+        return false;
+    vmvector_iterator_start(pending_protection_changes, &vmvi);
+    while (vmvector_iterator_hasnext(&vmvi)) {
+        app_pc entry_start, entry_end;
+        uint prot =
+            (uint)(ptr_uint_t)vmvector_iterator_next(&vmvi, &entry_start, &entry_end);
+        if (entry_start < end && start < entry_end) {
+            found = true;
+            if (TESTANY(MEMPROT_WRITE, prot))
+                *to_writable = true;
+        }
+    }
+    vmvector_iterator_stop(&vmvi);
+    return found;
+}
+
+/* Narrows [*start, *end), which contains pc, so that it lies either within one
+ * pending protection change or outside all of them, and returns whether pc is in
+ * one that makes the code writable.  A memory region can span pages with
+ * different pending changes, or with none.  Caller must hold the executable_areas
+ * lock.
+ */
+static bool
+clip_to_pending_protection_change(app_pc pc, app_pc *start /* IN/OUT */,
+                                  app_pc *end /* IN/OUT */)
+{
+    vmvector_iterator_t vmvi;
+    bool to_writable = false;
+    if (vmvector_empty(pending_protection_changes))
+        return false;
+    vmvector_iterator_start(pending_protection_changes, &vmvi);
+    while (vmvector_iterator_hasnext(&vmvi)) {
+        app_pc entry_start, entry_end;
+        uint prot =
+            (uint)(ptr_uint_t)vmvector_iterator_next(&vmvi, &entry_start, &entry_end);
+        if (entry_end <= *start || entry_start >= *end)
+            continue;
+        if (pc >= entry_start && pc < entry_end) {
+            *start = MAX(*start, entry_start);
+            *end = MIN(*end, entry_end);
+            if (TESTANY(MEMPROT_WRITE, prot))
+                to_writable = true;
+        } else if (entry_end <= pc)
+            *start = MAX(*start, entry_end);
+        else
+            *end = MIN(*end, entry_start);
+    }
+    vmvector_iterator_stop(&vmvi);
+    return to_writable;
+}
+
+#ifdef DEBUG
+/* Checks that we do not build a block from code that we take for read-only while
+ * its page is writable.
+ */
+static void
+check_code_not_writable(app_pc pc, uint frag_flags)
+{
+    uint prot;
+    bool to_writable;
+    bool own_lock = self_owns_write_lock(&executable_areas->lock);
+    if (!own_lock)
+        d_r_read_lock(&executable_areas->lock);
+    /* While a protection change is pending, the protection can be either the old or
+     * the new one (see app_memory_protection_change_start()).  Starting and
+     * finishing a change takes this lock, so we look for one before reading the
+     * protection.
+     */
+    if (!pending_protection_change(pc, pc + 1, &to_writable) &&
+        get_memory_info(pc, NULL, NULL, &prot)) {
+        ASSERT(!TESTANY(MEMPROT_WRITE, prot) ||
+               TESTANY(FRAG_SELFMOD_SANDBOXED, frag_flags) ||
+               !INTERNAL_OPTION(hw_cache_consistency));
+    }
+    if (!own_lock)
+        d_r_read_unlock(&executable_areas->lock);
+}
+#endif
+
+/* Making executable code writable removes its executable areas before the system
+ * call that changes the protection, so that no fragment of the old code survives
+ * the change.  Another thread that executes the code in between adds the areas
+ * back, and the protection it reads can still be the old, read-only one: the
+ * region then becomes writable without our knowing, and its fragments are never
+ * flushed when it is written.  Making it read-only ourselves is no remedy, as the
+ * pending change can undo that.  So until app_memory_protection_change_done(), we
+ * record the range, and check_thread_vm_area() sandboxes any area added in it.
+ * We also record changes that make code read-only: the region can be added with
+ * its new protection before the change takes effect, and check_thread_vm_area()
+ * must not take the old writable protection for an inconsistency.
+ * Call before app_memory_protection_change().
+ */
+void
+app_memory_protection_change_start(dcontext_t *dcontext, app_pc base, size_t size,
+                                   uint old_prot, uint prot /* MEMPROT_ */)
+{
+    app_pc end = (app_pc)ALIGN_FORWARD(base + size, PAGE_SIZE);
+    if (!INTERNAL_OPTION(hw_cache_consistency) || end <= base)
+        return;
+    /* old_prot is the protection we know of, which is read-only where we made
+     * writable code read-only ourselves (VM_MADE_READONLY).  The app takes that
+     * code for writable, and removing its area to apply the change restores the
+     * write permission until the system call: such a change is from writable too.
+     */
+    if (!TESTANY(MEMPROT_WRITE, old_prot | prot) &&
+        is_executable_area_writable_overlap(base, end) == NULL)
+        return;
+    /* The region need not have an executable area now: one can be added from the
+     * old protection while the change is pending.  Most changes are to data, so
+     * we avoid the write lock for those.
+     */
+    if (!TESTANY(MEMPROT_EXEC, old_prot | prot) &&
+        !executable_vm_area_overlap(base, end, false /*no lock*/))
+        return;
+    LOG(THREAD, LOG_VMAREAS, 2, "code region " PFX "-" PFX " is changing to %s\n", base,
+        end, memprot_string(prot));
+    d_r_write_lock(&executable_areas->lock);
+    vmvector_add(pending_protection_changes, base, end, (void *)(ptr_uint_t)prot);
+    d_r_write_unlock(&executable_areas->lock);
+}
+
+/* Call once the protection change started by app_memory_protection_change_start()
+ * has completed or failed.  An area that another thread added in the meantime is
+ * sandboxed, which is also correct for the new protection, unless the region is
+ * no longer executable: we then remove the area, as before the change.
+ */
+void
+app_memory_protection_change_done(dcontext_t *dcontext, app_pc base, size_t size,
+                                  uint prot /* platform independent MEMPROT_ */,
+                                  bool success)
+{
+    app_pc end = (app_pc)ALIGN_FORWARD(base + size, PAGE_SIZE);
+    bool remove_areas;
+    if (end <= base || vmvector_empty(pending_protection_changes))
+        return;
+    d_r_write_lock(&executable_areas->lock);
+    if (!vmvector_overlap(pending_protection_changes, base, end)) {
+        d_r_write_unlock(&executable_areas->lock);
+        return;
+    }
+    vmvector_remove(pending_protection_changes, base, end);
+    remove_areas = success && !TESTANY(MEMPROT_EXEC, prot) &&
+        executable_vm_area_overlap(base, end, true /*have writelock*/);
+    d_r_write_unlock(&executable_areas->lock);
+    if (remove_areas) {
+        LOG(THREAD, LOG_VMAREAS, 2,
+            "removing executable region " PFX "-" PFX " added during its change to %s\n",
+            base, end, memprot_string(prot));
+        flush_fragments_and_remove_region(dcontext, base, end - base,
+                                          false /* don't own initexit_lock */,
+                                          false /* keep futures */);
+    }
 }
 
 uint
@@ -8234,7 +8433,30 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
                 vm_flags |= VM_SHARED_MAPPING;
                 frag_flags |= FRAG_SELFMOD_SANDBOXED;
             }
-            if (TESTANY(MEMPROT_WRITE, prot)) {
+            /* A thread is making this region writable (see
+             * app_memory_protection_change_start()): the protection we read can be
+             * the old one, and page protection we set now can be undone.
+             */
+            app_pc area_start = base_pc, area_end = base_pc + size;
+            bool becoming_writable =
+                clip_to_pending_protection_change(pc, &area_start, &area_end);
+            base_pc = area_start;
+            size = area_end - area_start;
+            if (becoming_writable) {
+                LOG(GLOBAL, LOG_VMAREAS, 2,
+                    "\tNew executable region " PFX "-" PFX " is becoming writable\n",
+                    base_pc, base_pc + size);
+                frag_flags |= SANDBOX_FLAG();
+            } else {
+                /* The protection we read before taking the lock can predate a change
+                 * that has completed since: read it again now that a change cannot
+                 * start or finish (both take this lock).
+                 */
+                uint cur_prot;
+                if (get_memory_info(pc, NULL, NULL, &cur_prot))
+                    prot |= (cur_prot & MEMPROT_WRITE);
+            }
+            if (TESTANY(MEMPROT_WRITE, prot) || becoming_writable) {
                 vm_flags |= VM_WRITABLE;
                 STATS_INC(num_writable_code_regions);
                 /* Now that new area bounds are finalized, see if it should be
@@ -8463,11 +8685,7 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
      * Investigation is needed.  For now we avoid them in default debug runs.
      */
     DOCHECK(IF_MACOS64_ELSE(3, IF_AARCH64_ELSE(3, IF_RISCV64_ELSE(3, 1))), {
-        uint prot2;
-        ok = get_memory_info(pc, NULL, NULL, &prot2);
-        ASSERT(!ok || !TESTANY(MEMPROT_WRITE, prot2) ||
-               TESTANY(FRAG_SELFMOD_SANDBOXED, *flags) ||
-               !INTERNAL_OPTION(hw_cache_consistency));
+        check_code_not_writable(pc, *flags);
         ASSERT(is_readable_without_exception_try(pc, 1));
     });
 
@@ -9622,6 +9840,8 @@ vm_area_unlink_fragments(dcontext_t *dcontext, app_pc start, app_pc end,
     for (i = data->areas.length - 1; i >= 0; i--) {
         /* look for overlap */
         if (start < data->areas.buf[i].end && end > data->areas.buf[i].start) {
+            DEBUG_DECLARE(bool already_marked =
+                              TESTANY(VM_DELETE_ME, data->areas.buf[i].vm_flags);)
             LOG(thread_log, LOG_FRAGMENT | LOG_VMAREAS, 2,
                 "\tmarking region " PFX ".." PFX
                 " for deletion & unlinking all its frags\n",
@@ -9645,9 +9865,16 @@ vm_area_unlink_fragments(dcontext_t *dcontext, app_pc start, app_pc end,
             }
             /* i#942: We can't flush a fragment list with multiple also entries
              * from the same fragment on it, or our iteration gets derailed.
+             * A thread-private area that an earlier flush marked, and that its
+             * thread has not yet freed in vm_area_flush_fragments(), also holds
+             * the fragments that flush moved onto it below.  Those can start
+             * outside the area, but they are unlinked and have no also entries,
+             * so this walk does not change the list.
              */
-            DOCHECK(CHKLVL_DEFAULT,
-                    { vm_area_check_clean_fraglist(&data->areas.buf[i]); });
+            DOCHECK(CHKLVL_DEFAULT, {
+                if (!already_marked)
+                    vm_area_check_clean_fraglist(&data->areas.buf[i]);
+            });
             ASSERT(!TESTANY(FRAG_COARSE_GRAIN, data->areas.buf[i].frag_flags));
             for (entry = data->areas.buf[i].custom.frags; entry != NULL; entry = next) {
                 fragment_t *f = FRAG_FRAG(entry);
@@ -11272,6 +11499,22 @@ vm_area_selfmod_check_clear_exec_count(dcontext_t *dcontext, fragment_t *f)
                                     false /* keep futures */, true /* exec invalid */,
                                     false /* don't force synchall */,
                                     THREAD_SYNCH_NO_LOCKS_NO_XFER _IF_DGCDIAG(NULL));
+    if (convert_s2ro) {
+        bool to_writable;
+        /* A thread that is making the region writable may not have changed the
+         * protection yet (see app_memory_protection_change_start()): the page would
+         * become writable again after we make it read-only, while we take it for
+         * read-only.  We keep it sandboxed, which is right for the new protection.
+         * flush_* grabbed executable_areas lock for us, which a change also takes
+         * to start and finish.
+         */
+        if (pending_protection_change(start, end, &to_writable) && to_writable) {
+            LOG(THREAD, LOG_VMAREAS, 2,
+                "\tnot converting " PFX "-" PFX " to ro: becoming writable\n", start,
+                end);
+            convert_s2ro = false;
+        }
+    }
     if (convert_s2ro) {
         DODEBUG(ro2s->s2ro_xfers++;);
         /* flush_* grabbed executable_areas lock for us */
