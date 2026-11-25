@@ -354,10 +354,6 @@ save_fpstate(dcontext_t *dcontext, sigframe_rt_t *frame)
         /* this is "unlazy_fpu" */
         /* fxsaveq is only supported with gas >= 2.16 but we have that */
         asm volatile("fxsaveq %0 ; fnclex" : "=m"(temp->fxsave));
-        /* now convert into kernel_fpstate_t form */
-        ASSERT(sizeof(kernel_fpstate_t) == sizeof(struct i387_fxsave_struct));
-        memcpy(sc->fpstate, &temp->fxsave,
-               offsetof(struct i387_fxsave_struct, xmm_space));
 #else
         /* this is "unlazy_fpu" */
         asm volatile("fxsave %0 ; fnclex" : "=m"(temp->fxsave));
@@ -375,6 +371,16 @@ save_fpstate(dcontext_t *dcontext, sigframe_rt_t *frame)
     }
 
     save_xmm(dcontext, frame);
+#ifdef X64
+    /* save_xmm may execute x87-only XSAVE for a larger kernel xstate frame.
+     * FNCLEX above already cleared the live exception status, so that XSAVE
+     * must not replace the application's original x87 state. Copy the legacy
+     * prefix last, leaving the reconstructed SIMD registers and XSAVE header
+     * intact. Keep FNCLEX before the runtime work as in the original path.
+     */
+    ASSERT(sizeof(kernel_fpstate_t) == sizeof(struct i387_fxsave_struct));
+    memcpy(sc->fpstate, &temp->fxsave, offsetof(struct i387_fxsave_struct, xmm_space));
+#endif
 }
 
 #ifdef DEBUG
