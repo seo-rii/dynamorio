@@ -4889,6 +4889,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
     bool handled = false;
     bool reroute = false;
     bool at_auto_restart_syscall = false;
+    byte *pre_restart_xip = NULL;
     int syslen = 0;
     reg_t orig_retval_reg = sc->SC_RETURN_REG;
     sigpending_t *pend;
@@ -5107,6 +5108,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
                     "\n",
                     pc, pc + syslen);
                 at_auto_restart_syscall = true;
+                pre_restart_xip = (byte *)sc->SC_XIP;
                 sc->SC_XIP += syslen;
                 sc->SC_RETURN_REG = -EINTR;
                 pc = (byte *)sc->SC_XIP;
@@ -5145,6 +5147,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
          * existing sysenter restart mechanism.
          */
         at_auto_restart_syscall = true;
+        pre_restart_xip = (byte *)sc->SC_XIP;
         sc->SC_XIP = (reg_t)vsyscall_sysenter_return_pc;
         sc->SC_RETURN_REG = -EINTR;
         pc = (byte *)sc->SC_XIP;
@@ -5284,7 +5287,30 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
         /* Happened in DR, do not translate context.  Record for later processing
          * at a safe point with a clean app state.
          */
-        if (!blocked || sig >= OFFS_RT || (blocked && info->sigpending[sig] == NULL)) {
+        /* Queueing a signal when the pending-signal heap's first unit is full
+         * allocates a new unit, which is unsafe here: it acquires locks that the
+         * code we interrupted may hold.  When only one block is left we do not
+         * queue a standard signal that is already pending, which the kernel does
+         * not queue again either, and keep the block for a signal that is not.
+         */
+        int capacity = (int)DYNAMO_OPTION(max_pending_signals) *
+            /* receive_pending_signal() adds a second unit near the limit. */
+            (info->multiple_pending_units ? 2 : 1);
+        bool keep_last_block = sig < OFFS_RT && info->sigpending[sig] != NULL &&
+            info->num_pending + 1 >= capacity;
+        if (keep_last_block) {
+            STATS_INC(num_signals_dropped);
+            SYSLOG_INTERNAL_WARNING_ONCE("dropping already-pending standard signal");
+            if (at_auto_restart_syscall) {
+                /* No handler runs for this signal: let the kernel restart the
+                 * interrupted syscall instead of returning -EINTR to the app.
+                 */
+                sc->SC_XIP = (reg_t)pre_restart_xip;
+                sc->SC_RETURN_REG = orig_retval_reg;
+            }
+        }
+        if (!keep_last_block &&
+            (!blocked || sig >= OFFS_RT || (blocked && info->sigpending[sig] == NULL))) {
             /* only have 1 pending for blocked non-rt signals */
 
             /* To avoid accumulating signals if we're slow in presence of
