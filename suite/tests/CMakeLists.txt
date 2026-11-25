@@ -6424,6 +6424,10 @@ if (UNIX)
     # The x87 probe is x86-64 assembly.
     tobuild(linux.signal-x87-status linux/signal-x87-status.c)
   endif ()
+  if (LINUX AND X86 AND X64)
+    # The clone3 trampoline is x86-64 assembly.
+    tobuild(linux.clone3-clear-sighand linux/clone3-clear-sighand.c)
+  endif ()
 
   if (NOT RISCV64)
     # runs of other builds with custom DR options

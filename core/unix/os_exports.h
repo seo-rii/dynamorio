@@ -587,6 +587,10 @@ void *
 get_clone_record(reg_t xsp);
 
 #ifdef LINUX
+void
+signal_prepare_clone_child(void *clone_record);
+void
+signal_finish_clone_child(dcontext_t *dcontext, void *clone_record);
 /* No child was created; caller holds thread_initexit_lock. */
 void
 destroy_failed_clone_record(dcontext_t *dcontext, void *clone_record);

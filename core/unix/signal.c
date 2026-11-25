@@ -61,6 +61,9 @@
 
 #ifdef LINUX
 #    include <linux/sched.h>
+#    ifndef CLONE_CLEAR_SIGHAND
+#        define CLONE_CLEAR_SIGHAND 0x100000000ULL
+#    endif
 #endif
 
 #include <sys/time.h>
@@ -274,6 +277,12 @@ static bool multiple_handlers_present; /* Accessed using atomics, not the lock. 
 /* in x86.asm */
 void
 main_signal_handler(int sig, kernel_siginfo_t *siginfo, kernel_ucontext_t *ucxt);
+
+static void
+set_handler_sigact_no_logging(kernel_sigaction_t *act, int sig, handler_t handler);
+
+static void
+set_our_handler_sigact(kernel_sigaction_t *act, int sig);
 
 static void
 set_handler_and_record_app(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
@@ -981,6 +990,29 @@ get_clone_record(reg_t xsp)
 }
 
 #ifdef LINUX
+/* clone3 can clear our handlers before the child has any TLS or signal state.
+ * Restore only the fault handlers needed by safe_read during TLS initialization.
+ * The remaining handlers are restored after signal_thread_inherit is complete.
+ * No TLS lookup, logging, allocation, or signal-mask change is safe here.
+ */
+void
+signal_prepare_clone_child(void *clone_record)
+{
+    clone_record_t *record = (clone_record_t *)clone_record;
+    if (record->clone_sysnum != SYS_clone3 ||
+        !TESTANY(CLONE_CLEAR_SIGHAND, record->clone_flags))
+        return;
+    const int faults[] = { SIGSEGV, SIGBUS };
+    for (uint i = 0; i < sizeof(faults) / sizeof(faults[0]); i++) {
+        if (!record->info.sighand->we_intercept[faults[i]])
+            continue;
+        kernel_sigaction_t act;
+        set_handler_sigact_no_logging(&act, faults[i], (handler_t)main_signal_handler);
+        DEBUG_DECLARE(int rc =) sigaction_syscall(faults[i], &act, NULL);
+        ASSERT(rc == 0);
+    }
+}
+
 void
 destroy_failed_clone_record(dcontext_t *dcontext, void *clone_record)
 {
@@ -1177,6 +1209,9 @@ signal_thread_inherit(dcontext_t *dcontext, void *clone_record)
     clone_record_t *record = (clone_record_t *)clone_record;
     thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
     int i;
+    bool clear_sighand = false;
+    IF_LINUX(if (record != NULL && record->clone_sysnum == SYS_clone3) clear_sighand =
+                 TESTANY(CLONE_CLEAR_SIGHAND, record->clone_flags);)
     if (record != NULL) {
         LOG(THREAD, LOG_ASYNCH, 1, "continuation pc is " PFX "\n",
             record->continuation_pc);
@@ -1241,6 +1276,19 @@ signal_thread_inherit(dcontext_t *dcontext, void *clone_record)
                         dcontext, sizeof(kernel_sigaction_t));
                     memcpy(info->sighand->action[i], record->info.sighand->action[i],
                            sizeof(kernel_sigaction_t));
+                    if (clear_sighand) {
+                        /* Match Linux flush_signal_handlers(): preserve only SIG_IGN,
+                         * and reset flags, restorer, and mask even for ignored signals.
+                         * Do not sample the kernel here: it cleared DR's handler, not
+                         * the application's virtualized disposition.
+                         */
+                        handler_t handler =
+                            info->sighand->action[i]->handler == (handler_t)SIG_IGN
+                            ? (handler_t)SIG_IGN
+                            : (handler_t)SIG_DFL;
+                        memset(info->sighand->action[i], 0, sizeof(kernel_sigaction_t));
+                        info->sighand->action[i]->handler = handler;
+                    }
                     LOG(THREAD, LOG_ASYNCH, 2, "\thandler for signal %d is " PFX "\n", i,
                         info->sighand->action[i]->handler);
                 }
@@ -1383,6 +1431,20 @@ signal_thread_inherit(dcontext_t *dcontext, void *clone_record)
 
     /* Assumed to be async safe. */
     info->fully_initialized = true;
+    if (clear_sighand) {
+        /* This child has a private signal table.  Restore only DR's existing
+         * interceptions after all per-thread state is ready for delivery.
+         * Keep the already reconstructed application dispositions intact.
+         */
+        for (i = 1; i <= MAX_SIGNUM; i++) {
+            if (!info->sighand->we_intercept[i])
+                continue;
+            kernel_sigaction_t act;
+            set_our_handler_sigact(&act, i);
+            DEBUG_DECLARE(int rc =) sigaction_syscall(i, &act, NULL);
+            ASSERT(rc == 0);
+        }
+    }
     DOLOG(4, LOG_ASYNCH, dump_unmasked(dcontext, __FUNCTION__););
 }
 
@@ -1689,8 +1751,8 @@ signal_thread_exit(dcontext_t *dcontext, bool other_thread)
 #endif
 }
 
-void
-set_handler_sigact(kernel_sigaction_t *act, int sig, handler_t handler)
+static void
+set_handler_sigact_no_logging(kernel_sigaction_t *act, int sig, handler_t handler)
 {
     act->handler = handler;
 #ifdef MACOS
@@ -1729,6 +1791,12 @@ set_handler_sigact(kernel_sigaction_t *act, int sig, handler_t handler)
     kernel_sigdelset(&act->mask, SIGSEGV);
     if (sig == SUSPEND_SIGNAL || sig == SIGSEGV)
         act->flags |= SA_NODEFER;
+}
+
+void
+set_handler_sigact(kernel_sigaction_t *act, int sig, handler_t handler)
+{
+    set_handler_sigact_no_logging(act, sig, handler);
     /* Sigset is a 1 or 2 elt array of longs on X64/X86.  Treat as 2 elt of
      * uint32. */
     IF_DEBUG(uint32 *mask_sig = (uint32 *)&act->mask.sig[0]);
@@ -2444,6 +2512,21 @@ set_blocked(dcontext_t *dcontext, kernel_sigset_t *set, bool absolute)
     DOLOG(4, LOG_ASYNCH, dump_unmasked(dcontext, __FUNCTION__););
     d_r_mutex_unlock(&info->sigblocked_lock);
 }
+
+#ifdef LINUX
+/* thread_starting() imports the real kernel mask.  A controlled parent also has
+ * virtually blocked signals, which the kernel cannot copy into a clone child.
+ * Preserve that part of the inherited mask without discarding the real mask.
+ */
+void
+signal_finish_clone_child(dcontext_t *dcontext, void *clone_record)
+{
+    clone_record_t *record = (clone_record_t *)clone_record;
+    if (record->clone_sysnum == SYS_clone3 &&
+        TESTANY(CLONE_CLEAR_SIGHAND, record->clone_flags))
+        set_blocked(dcontext, &record->info.app_sigblocked, false /*relative*/);
+}
+#endif
 
 void
 signal_set_mask(dcontext_t *dcontext, kernel_sigset_t *sigset)

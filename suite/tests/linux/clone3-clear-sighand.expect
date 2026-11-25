@@ -1,0 +1,2 @@
+vfork child: ok
+vfork child with failed execve: ok
