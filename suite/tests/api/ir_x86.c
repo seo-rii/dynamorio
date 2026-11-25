@@ -1770,6 +1770,42 @@ test_regs(void *dc)
     ASSERT(reg != DR_REG_XMM1);
 }
 
+/* A 64-bit instr address stored as two 32-bit immediates keeps the size and
+ * shift of each half when its list is cloned, as trace building does.
+ */
+static void
+test_instrlist_clone_instr_halves(void *dc)
+{
+    instrlist_t *ilist = instrlist_create(dc), *clone;
+    instr_t *label = INSTR_CREATE_label(dc), *in;
+    byte buf[64], copy_buf[64], *end, *copy_end;
+    int halves = 0;
+    instrlist_append(ilist, label);
+    instrlist_append(ilist,
+                     INSTR_CREATE_mov_st(dc, OPND_CREATE_MEM32(DR_REG_XAX, 0),
+                                         opnd_create_instr_ex(label, OPSZ_4, 0)));
+    instrlist_append(ilist,
+                     INSTR_CREATE_mov_st(dc, OPND_CREATE_MEM32(DR_REG_XAX, 4),
+                                         opnd_create_instr_ex(label, OPSZ_4, 32)));
+    clone = instrlist_clone(dc, ilist);
+    for (in = instrlist_first(clone); in != NULL; in = instr_get_next(in)) {
+        opnd_t src;
+        if (instr_is_label(in))
+            continue;
+        src = instr_get_src(in, 0);
+        ASSERT(opnd_is_instr(src) && opnd_get_instr(src) == instrlist_first(clone));
+        ASSERT(opnd_get_size(src) == OPSZ_4 && opnd_get_shift(src) == 32 * halves);
+        halves++;
+    }
+    ASSERT(halves == 2);
+    end = instrlist_encode(dc, ilist, buf, true);
+    copy_end = instrlist_encode_to_copy(dc, clone, copy_buf, buf, NULL, true);
+    ASSERT(end != NULL && copy_end != NULL && end - buf == copy_end - copy_buf);
+    ASSERT(memcmp(buf, copy_buf, end - buf) == 0);
+    instrlist_clear_and_destroy(dc, ilist);
+    instrlist_clear_and_destroy(dc, clone);
+}
+
 static void
 test_instr_opnds(void *dc)
 {
@@ -3052,6 +3088,8 @@ main(int argc, char *argv[])
     test_regs(dcontext);
 
     test_instr_opnds(dcontext);
+
+    test_instrlist_clone_instr_halves(dcontext);
 
     test_strict_invalid(dcontext);
 

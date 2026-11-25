@@ -2986,6 +2986,15 @@ if (NOT ARM AND NOT RISCV64) # XXX i#2094: implement cleancall optimizations on 
     tobuild_ci(client.cleancall-eflags-ac client-interface/cleancall-eflags-ac.c ""
       "-no_cleancall_ignore_eflags" "")
   endif ()
+  if (X86 AND LINUX)
+    # Bounded delivery of a signal that arrives in a clean callee, with the
+    # context saved inline and out of line, and with where-am-I tracking.
+    tobuild_ci(client.cleancall-signal client-interface/cleancall-signal.c "" "" "")
+    torunonly_ci(client.cleancall-signal-ool client.cleancall-signal
+      client.cleancall-signal.dll client-interface/cleancall-signal.c "out_of_line" "" "")
+    torunonly_ci(client.cleancall-signal-prof-pcs client.cleancall-signal
+      client.cleancall-signal.dll client-interface/cleancall-signal.c "" "-prof_pcs" "")
+  endif ()
   if (CMAKE_COMPILER_IS_CLANG)
     optimize(client.inline.dll)
   endif ()

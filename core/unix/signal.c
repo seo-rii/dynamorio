@@ -4880,6 +4880,77 @@ find_next_fragment_from_gencode(dcontext_t *dcontext, sigcontext_t *sc)
     return f;
 }
 
+/* Returns whether pc follows a direct call to the out-of-line clean call save
+ * routine, which is how emit_clean_call_save() records the clean call's address.
+ */
+static bool
+is_clean_call_save_return(dcontext_t *dcontext, cache_pc pc)
+{
+#ifdef X86
+    byte call[5];
+    if (pc == NULL || !in_fcache(pc) ||
+        !d_r_safe_read(pc - sizeof(call), sizeof(call), call))
+        return false;
+    return call[0] == RAW_OPCODE_call &&
+        pc + *(int *)&call[1] == get_clean_call_save(dcontext _IF_X64(GENCODE_X64));
+#else
+    return false;
+#endif
+}
+
+/* A signal that interrupts a clean callee, or code the callee calls, waits for
+ * the thread's next exit from the code cache, and a loop of linked fragments may
+ * never take one.  The out-of-line clean call save recorded the clean call's code
+ * cache address in the pc slot of the context it saved: unlink that fragment, as
+ * for a signal that arrives in the cache, so the thread exits to d_r_dispatch at
+ * the fragment's next exit.  Inline context switches record nothing, so their
+ * callees keep the old behavior.
+ */
+static void
+unlink_fragment_of_clean_call(dcontext_t *dcontext, thread_sig_info_t *info, byte *pc,
+                              byte *xsp)
+{
+    cache_pc call_pc;
+    fragment_t wrapper;
+    fragment_t *f;
+    /* Only a clean callee runs on the dstack while control is still in the cache.
+     * DR code may hold the locks the lookup and unlinking need, and so may a thread
+     * that is linking: their signals keep waiting for d_r_dispatch.  Private
+     * libraries make their system calls through client_int_syscall where it is
+     * their vsyscall (i#555), so a signal from a callee's own system call arrives
+     * there, in DR but holding no lock.
+     */
+    if ((dcontext->whereami != DR_WHERE_FCACHE &&
+         dcontext->whereami != DR_WHERE_CLEAN_CALLEE) ||
+        info->interrupted != NULL || !is_on_dstack(dcontext, xsp) ||
+        (is_in_dynamo_dll(pc) && pc != (byte *)client_int_syscall + INT_LENGTH) ||
+        is_couldbelinking(dcontext) ||
+        /* A callee that asked DR to flush is called back with DR's locks held:
+         * the flush completion callback and fragment deletion events.
+         */
+        is_self_flushing() || is_self_allsynch_flushing() ||
+        self_owns_recursive_lock(&change_linking_lock))
+        return;
+    /* An inline context switch leaves a stale value or zero here: only take the
+     * return address of a call to the save routine.
+     */
+    call_pc = get_priv_mcontext_from_dstack(dcontext)->pc;
+    if (!is_clean_call_save_return(dcontext, call_pc))
+        return;
+    /* PR 213040: we can't unlink coarse. */
+    if (get_fcache_coarse_info(call_pc) != NULL)
+        return;
+    f = fragment_pclookup(dcontext, call_pc, &wrapper);
+    if (f == NULL || TESTANY(FRAG_COARSE_GRAIN, f->flags))
+        return;
+    LOG(THREAD, LOG_ASYNCH, 2, "\tsignal in clean callee: delaying until exit F%d\n",
+        f->id);
+    if (unlink_fragment_for_signal(dcontext, f, call_pc)) {
+        info->interrupted = f;
+        info->interrupted_pc = call_pc;
+    }
+}
+
 static void
 record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
                       sigframe_rt_t *frame, bool forged, byte *access_address)
@@ -5186,6 +5257,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
             abort_on_DR_fault(dcontext, pc, NULL, sig, frame,
                               (sig == SIGSEGV) ? "SEGV" : "other", " unknown");
         }
+        unlink_fragment_of_clean_call(dcontext, info, pc, xsp);
     }
 
     LOG(THREAD, LOG_ASYNCH, 3, "\taction is not SIG_IGN\n");
