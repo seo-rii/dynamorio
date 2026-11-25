@@ -268,7 +268,7 @@ move_to_start_of_cache_line(dr_isa_mode_t isa_mode, byte *pc)
  * for thread-private and thread-shared.  So, we dynamically extend the size
  * as we generate.  Currently our max is under 5 pages.
  */
-#define GENCODE_RESERVE_SIZE (5 * PAGE_SIZE)
+#define GENCODE_RESERVE_SIZE (6 * PAGE_SIZE)
 
 #define GENCODE_COMMIT_SIZE \
     ((size_t)(ALIGN_FORWARD(sizeof(generated_code_t), PAGE_SIZE) + PAGE_SIZE))
