@@ -109,6 +109,10 @@ ipc_reader_t::read_next_entry()
             cur_buf_->type = TRACE_TYPE_FOOTER;
             cur_buf_->size = 0;
             cur_buf_->addr = 0;
+            // The rest of buf_ still holds the previous read: end the buffer
+            // after the footer so that the next call reads again and returns
+            // nullptr instead of those stale entries.
+            end_buf_ = cur_buf_ + 1;
             at_eof_ = true;
             return cur_buf_;
         }
