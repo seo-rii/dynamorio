@@ -2670,6 +2670,21 @@ emit_indirect_branch_lookup(dcontext_t *dcontext, generated_code_t *code, byte *
     /*>>>    SAVE_TO_UPCONTEXT %xbx,xbx_OFFSET                       */
     APP(&ilist, target_delete_entry);
 
+    if (ibl_use_target_prefix(ibl_code)) {
+        /* Take the tag from where the hit path kept it, not from the table
+         * entry in %xcx, whose tag a racing removal may already have replaced
+         * with FAKE_TAG (see append_ibl_found()).  The entry pointer is dead
+         * from here on, so %xcx carries the tag past the linkstub stores below,
+         * which can reuse the slot.
+         *>>>    RESTORE_FROM_UPCONTEXT IBL_HIT_TAG,%xcx
+         */
+        if (absolute) {
+            APP(&ilist, RESTORE_FROM_DC(dcontext, SCRATCH_REG2, IBL_HIT_TAG_OFFS));
+        } else {
+            APP(&ilist, RESTORE_FROM_TLS(dcontext, SCRATCH_REG2, IBL_HIT_TAG_SLOT));
+        }
+    }
+
     if (linkstub == NULL) {
         /* If coming from an inlined ibl, the linkstub was not stored, so
          * we use a special linkstub_t in the last_exit "slot" (xdi / tls xdx) for any
@@ -2716,9 +2731,9 @@ emit_indirect_branch_lookup(dcontext_t *dcontext, generated_code_t *code, byte *
        * but one at least was a post-syscall!
        */
 
-    /* load the tag value from the table ptr in xcx into xbx, so    */
-    /* that it gets shuffled into xcx by the following instruction  */
-    /*>>>    mov     (%xcx), %xbx                                   */
+    /* put the tag in xbx, so that it gets shuffled into xcx by the */
+    /* following instruction                                        */
+    /*>>>    mov     %xcx, %xbx                                     */
     if (!ibl_use_target_prefix(ibl_code)) {
         /* case 9688: for no-prefix-target ibl we stored the tag in xax slot
          * in the hit path.  we also restored eflags already.
@@ -2735,8 +2750,8 @@ emit_indirect_branch_lookup(dcontext_t *dcontext, generated_code_t *code, byte *
         }
     } else {
         APP(&ilist,
-            XINST_CREATE_load(dcontext, opnd_create_reg(SCRATCH_REG1),
-                              OPND_CREATE_MEMPTR(SCRATCH_REG2, FRAGMENT_TAG_OFFS)));
+            XINST_CREATE_move(dcontext, opnd_create_reg(SCRATCH_REG1),
+                              opnd_create_reg(SCRATCH_REG2)));
     }
 
     /* Add to the patch list right away; hashtable stats could be added

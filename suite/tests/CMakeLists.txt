@@ -2973,6 +2973,11 @@ if (NOT ARM AND NOT RISCV64) # XXX i#2094: implement cleancall optimizations on 
   endif ()
 
   tobuild_ci(client.inline client-interface/inline.c "" "-opt_cleancall 3" "")
+  if (X86 AND X64 AND LINUX)
+    # Full eflags handling around optimized clean calls (EFLAGS.AC).
+    tobuild_ci(client.cleancall-eflags-ac client-interface/cleancall-eflags-ac.c ""
+      "-no_cleancall_ignore_eflags" "")
+  endif ()
   if (CMAKE_COMPILER_IS_CLANG)
     optimize(client.inline.dll)
   endif ()
@@ -6194,6 +6199,9 @@ if (UNIX)
     tobuild(linux.prctl linux/prctl.c)
   endif ()
   tobuild(linux.mmap linux/mmap.c)
+  if (LINUX AND X86) # The test generates x86 code and uses memfd_create().
+    tobuild(linux.mmap-fixed-code linux/mmap-fixed-code.c)
+  endif ()
   tobuild(linux.zero-length-mem-ranges linux/zero-length-mem-ranges.c)
   tobuild(linux.signal0000 linux/signal0000.c)
   tobuild(linux.signal0001 linux/signal0001.c)
@@ -6257,6 +6265,10 @@ if (UNIX)
     endif ()
 
     if (X86) # The test generates x86 code.
+      # -slowdown_ibl_found takes effect only with internal options.
+      tobuild_ops(linux.ibl-delete-race linux/ibl-delete-race.c
+        "-disable_traces -slowdown_ibl_found 20000" "")
+      link_with_pthread(linux.ibl-delete-race)
       tobuild_ops(linux.selfmod-patch-race linux/selfmod-patch-race.c
         "-sandbox_writable" "")
       link_with_pthread(linux.selfmod-patch-race)
@@ -6370,6 +6382,10 @@ if (UNIX)
     # TODO i#3544: Port tests to RISC-V 64
     tobuild_ops(linux.vfork linux/vfork.c "" "${execve-sub-path}")
     #tobuild(linux.vfork-fib linux/vfork-fib.c)
+  endif ()
+  if (LINUX AND X86 AND X64)
+    # The x87 probe is x86-64 assembly.
+    tobuild(linux.signal-x87-status linux/signal-x87-status.c)
   endif ()
 
   if (NOT RISCV64)

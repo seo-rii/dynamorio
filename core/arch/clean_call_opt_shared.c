@@ -623,6 +623,15 @@ analyze_clean_call_inline(dcontext_t *dcontext, clean_call_info_t *cci)
             info->start, INTERNAL_OPTION(opt_cleancall));
         opt_inline = false;
     }
+#ifdef X86
+    /* An inlined callee runs with the application's eflags, including AC. */
+    if (!dynamo_options.cleancall_ignore_eflags) {
+        LOG(THREAD, LOG_CLEANCALL, 2,
+            "CLEANCALL: fail inlining clean call " PFX ", full eflags requested.\n",
+            info->start);
+        opt_inline = false;
+    }
+#endif
     if (cci->num_args > 1) {
         LOG(THREAD, LOG_CLEANCALL, 2,
             "CLEANCALL: fail inlining clean call " PFX ", number of args %d > 1.\n",
