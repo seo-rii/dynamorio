@@ -2973,6 +2973,11 @@ if (NOT ARM AND NOT RISCV64) # XXX i#2094: implement cleancall optimizations on 
   endif ()
 
   tobuild_ci(client.inline client-interface/inline.c "" "-opt_cleancall 3" "")
+  if (X86 AND X64 AND LINUX)
+    # Full eflags handling around optimized clean calls (EFLAGS.AC).
+    tobuild_ci(client.cleancall-eflags-ac client-interface/cleancall-eflags-ac.c ""
+      "-no_cleancall_ignore_eflags" "")
+  endif ()
   if (CMAKE_COMPILER_IS_CLANG)
     optimize(client.inline.dll)
   endif ()
@@ -6196,6 +6201,9 @@ if (UNIX)
     tobuild(linux.prctl linux/prctl.c)
   endif ()
   tobuild(linux.mmap linux/mmap.c)
+  if (LINUX AND X86) # The test generates x86 code and uses memfd_create().
+    tobuild(linux.mmap-fixed-code linux/mmap-fixed-code.c)
+  endif ()
   tobuild(linux.zero-length-mem-ranges linux/zero-length-mem-ranges.c)
   tobuild(linux.signal0000 linux/signal0000.c)
   tobuild(linux.signal0001 linux/signal0001.c)
@@ -6258,6 +6266,21 @@ if (UNIX)
       link_with_pthread(linux.synchall-restore)
     endif ()
 
+    if (X86) # The test generates x86 code.
+      # -slowdown_ibl_found takes effect only with internal options.
+      tobuild_ops(linux.ibl-delete-race linux/ibl-delete-race.c
+        "-disable_traces -slowdown_ibl_found 20000" "")
+      link_with_pthread(linux.ibl-delete-race)
+      tobuild(linux.signal-flush-race linux/signal-flush-race.c)
+      link_with_pthread(linux.signal-flush-race)
+    endif ()
+
+    # The race is detected by a consistency check in debug builds.
+    if (X86 AND DEBUG) # The test generates x86 code.
+      tobuild(linux.mprotect-code-race linux/mprotect-code-race.c)
+      link_with_pthread(linux.mprotect-code-race)
+    endif ()
+
     if (NOT ANDROID)
       tobuild(linux.threadexit2 linux/threadexit2.c) # XXX i#1874: hangs on Android
       tobuild(linux.signalfd linux/signalfd.c) # XXX i#1874: fails natively on Android
@@ -6284,6 +6307,9 @@ if (UNIX)
   tobuild(linux.eintr linux/eintr.c)
   link_with_pthread(linux.eintr)
   torunonly(linux.eintr-noinline linux.eintr linux/eintr.c "-no_ignore_syscalls" "")
+  if (LINUX)
+    tobuild(linux.close_range linux/close_range.c)
+  endif ()
 
   if (NOT ANDROID AND NOT RISCV64) # XXX i#1874: get working on Android
     # TODO i#3544: Port tests to RISC-V 64
@@ -6369,6 +6395,10 @@ if (UNIX)
     # Concurrent vfork children of different parent threads.
     tobuild_ops(linux.vfork-concurrent linux/vfork-concurrent.c "" "${execve-sub-path}")
     link_with_pthread(linux.vfork-concurrent)
+  endif ()
+  if (LINUX AND X86 AND X64)
+    # The x87 probe is x86-64 assembly.
+    tobuild(linux.signal-x87-status linux/signal-x87-status.c)
   endif ()
 
   if (NOT RISCV64)
