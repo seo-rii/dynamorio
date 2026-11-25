@@ -6788,11 +6788,13 @@ dr_get_mcontext_priv(dcontext_t *dcontext, dr_mcontext_t *dmc, priv_mcontext_t *
      * If we do we'll have to adopt a different solution for i#1685 in our Windows
      * hooks where today we use the pc slot for temp storage.
      * The out-of-line clean call save records a code cache address there for the
-     * signal handler: do not report it.
+     * signal handler: do not report it, also not to a request for part of the
+     * context or from a client built with a smaller dr_mcontext_t.
      */
     if (mc != NULL)
         mc->pc = NULL;
-    else if (TESTALL(DR_MC_ALL, dmc->flags) && dmc->size == sizeof(dr_mcontext_t))
+    else if (TESTANY(DR_MC_CONTROL, dmc->flags) &&
+             dmc->size > offsetof(dr_mcontext_t, pc))
         dmc->pc = NULL;
 
     return true;

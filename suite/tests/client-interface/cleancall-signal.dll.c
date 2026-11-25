@@ -33,7 +33,8 @@
 /* Inserts a clean call at the start of every block.  Once one block has run
  * FIRE times, the callee sends SIGUSR1 to its own thread: the kernel delivers
  * it on return from the system call, inside the callee.  With "out_of_line" the
- * clean call saves its context out of line.
+ * clean call saves its context out of line.  The callee also checks that the
+ * context it reads has no pc.
  */
 
 #include "dr_api.h"
@@ -54,9 +55,15 @@ static void
 callee(unsigned int *count)
 {
     if (++*count == FIRE && !fired) {
+        void *drcontext = dr_get_current_drcontext();
+        /* Part of the context: the out-of-line save keeps a code cache address
+         * in the pc slot, which must not be reported for any request.
+         */
+        dr_mcontext_t mc = { sizeof(mc), DR_MC_CONTROL | DR_MC_INTEGER };
+        if (!dr_get_mcontext(drcontext, &mc) || mc.pc != NULL)
+            dr_fprintf(STDERR, "clean call context has pc " PFX "\n", mc.pc);
         fired = 1;
-        syscall(SYS_tgkill, dr_get_process_id(),
-                dr_get_thread_id(dr_get_current_drcontext()), SIGUSR1);
+        syscall(SYS_tgkill, dr_get_process_id(), dr_get_thread_id(drcontext), SIGUSR1);
     }
 }
 
@@ -67,8 +74,9 @@ event_bb(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool trans
 {
     unsigned int *count = &counts[((ptr_uint_t)tag >> 2) & (SLOTS - 1)];
     dr_insert_clean_call_ex(drcontext, bb, instrlist_first_app(bb), (void *)callee,
-                            out_of_line ? DR_CLEANCALL_ALWAYS_OUT_OF_LINE : 0, 1,
-                            OPND_CREATE_INTPTR(count));
+                            DR_CLEANCALL_READS_APP_CONTEXT |
+                                (out_of_line ? DR_CLEANCALL_ALWAYS_OUT_OF_LINE : 0),
+                            1, OPND_CREATE_INTPTR(count));
     return DR_EMIT_DEFAULT;
 }
 
