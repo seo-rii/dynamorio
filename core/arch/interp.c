@@ -223,6 +223,20 @@ typedef struct {
     instr_t *instr;                    /* the current instr */
     int eflags;
     app_pc pretend_pc; /* selfmod only: decode from separate pc */
+#ifdef X86
+    /* A sandboxed block that is built for the cache is decoded from a copy of its
+     * app code, starting at start_pc, which also becomes the copy that the
+     * block's entry check compares the app code with (see
+     * bb_decode_selfmod_snapshot()).  NULL if not used.
+     */
+    byte *selfmod_snapshot;
+    uint selfmod_snapshot_capacity; /* bytes of app code selfmod_snapshot can hold */
+    uint selfmod_snapshot_len;      /* bytes of app code read into selfmod_snapshot */
+    /* The snapshot could not be taken: the rest of the block was decoded from the
+     * app code, and the copy is read from the app code when the block is emitted.
+     */
+    bool selfmod_snapshot_failed;
+#endif
 #ifdef ARM
     dr_pred_type_t svc_pred; /* predicate for conditional svc */
 #endif
@@ -2700,6 +2714,203 @@ client_check_syscall(instrlist_t *ilist, instr_t *inst, bool *found_syscall,
     return true;
 }
 
+#ifdef X86
+/* The app code of a sandboxed block can change at any time, including between
+ * our decoding the block and our copying the code into the fragment for the
+ * block's entry check.  A copy taken after such a change matches the new code,
+ * so the check keeps passing while the block runs the old code.  We therefore
+ * decode a sandboxed block from a snapshot of its code, read before each
+ * instruction is decoded, and later store that snapshot as the copy (see
+ * bb_build_selfmod_snapshot()).  The check then compares the app code with
+ * exactly the code that the block was built from.  Encoding the block copies the
+ * raw bits of its instructions, so once the block is mangled we point them into
+ * the snapshot as well (see bb_encode_from_selfmod_snapshot()).
+ */
+
+/* Zeroes after the code read into the snapshot, so that decoding past it stays
+ * in our buffer: a zero byte is no prefix, and as a ModRM byte it ends the
+ * instruction.
+ */
+#    define SELFMOD_SNAPSHOT_SLACK (2 * MAX_INSTR_LENGTH)
+
+static void
+bb_start_selfmod_snapshot(build_bb_t *bb)
+{
+    /* The ilist clone kept for trace building would outlive the snapshot that its
+     * raw bits point into.
+     */
+    if (!bb->for_cache || bb->pretend_pc != NULL || bb->unmangled_ilist != NULL)
+        return;
+    if (bb->selfmod_snapshot == NULL) {
+        /* Room for as many instructions as a block normally has.  Beyond that, we
+         * decode from the app code (see bb_decode_selfmod_snapshot()).
+         */
+        bb->selfmod_snapshot_capacity =
+            (DYNAMO_OPTION(max_bb_instrs) + 1) * MAX_INSTR_LENGTH;
+        bb->selfmod_snapshot = (byte *)heap_alloc(
+            GLOBAL_DCONTEXT,
+            bb->selfmod_snapshot_capacity + SELFMOD_SNAPSHOT_SLACK HEAPACCT(ACCT_OTHER));
+    }
+    bb->selfmod_snapshot_len = 0;
+    bb->selfmod_snapshot_failed = false;
+}
+
+static void
+bb_free_selfmod_snapshot(build_bb_t *bb)
+{
+    if (bb->selfmod_snapshot == NULL)
+        return;
+    heap_free(GLOBAL_DCONTEXT, bb->selfmod_snapshot,
+              bb->selfmod_snapshot_capacity +
+                  SELFMOD_SNAPSHOT_SLACK HEAPACCT(ACCT_OTHER));
+    bb->selfmod_snapshot = NULL;
+}
+
+/* Reads the app code up to start_pc + len into the snapshot.  Returns whether all
+ * of it could be read.
+ */
+static bool
+bb_extend_selfmod_snapshot(build_bb_t *bb, uint len)
+{
+    bool ok = true;
+    ASSERT(len <= bb->selfmod_snapshot_capacity);
+    if (len > bb->selfmod_snapshot_len) {
+        size_t got = 0;
+        ok = safe_read_ex(bb->start_pc + bb->selfmod_snapshot_len,
+                          len - bb->selfmod_snapshot_len,
+                          bb->selfmod_snapshot + bb->selfmod_snapshot_len, &got);
+        bb->selfmod_snapshot_len += (uint)got;
+    }
+    memset(bb->selfmod_snapshot + bb->selfmod_snapshot_len, 0, SELFMOD_SNAPSHOT_SLACK);
+    return ok;
+}
+
+/* Decodes the instruction at bb->cur_pc from the snapshot, which is read first.
+ * Returns the pc after the instruction, or NULL, as decode() does.
+ */
+static byte *
+bb_decode_selfmod_snapshot(dcontext_t *dcontext, build_bb_t *bb)
+{
+    uint offs = (uint)(bb->cur_pc - bb->start_pc);
+    uint want = offs + MAX_INSTR_LENGTH;
+    /* We read ahead only on the page the instruction starts on: the next page can
+     * be unreadable without the instruction extending onto it.
+     */
+    uint on_page = (uint)((app_pc)PAGE_START(bb->cur_pc) + PAGE_SIZE - bb->cur_pc);
+    byte *copy_pc, *next;
+    ASSERT(!bb->selfmod_snapshot_failed && offs <= bb->selfmod_snapshot_len);
+    if (want > bb->selfmod_snapshot_capacity ||
+        !bb_extend_selfmod_snapshot(bb, offs + MIN(MAX_INSTR_LENGTH, on_page)))
+        goto decode_app_code;
+    copy_pc = bb->selfmod_snapshot + offs;
+    next = decode_from_copy(dcontext, copy_pc, bb->cur_pc, bb->instr);
+    if ((next == NULL || next > bb->selfmod_snapshot + bb->selfmod_snapshot_len) &&
+        bb->selfmod_snapshot_len < want) {
+        /* The instruction can continue on the next page. */
+        instr_reset(dcontext, bb->instr);
+        if (!bb_extend_selfmod_snapshot(bb, want))
+            goto decode_app_code;
+        next = decode_from_copy(dcontext, copy_pc, bb->cur_pc, bb->instr);
+    }
+    if (next != NULL && next > bb->selfmod_snapshot + bb->selfmod_snapshot_len) {
+        /* Longer than any valid instruction. */
+        instr_reset(dcontext, bb->instr);
+        goto decode_app_code;
+    }
+    if (next == NULL)
+        return NULL;
+    /* Leave the raw bits at the app pc, as decode() does: building and mangling the
+     * block take them for the instruction's app address.  This also drops the
+     * rip-relative position, so that pc-relative targets come from the operands,
+     * which are resolved against the app pc.  bb_encode_from_selfmod_snapshot()
+     * points the raw bits at the snapshot once the block is mangled.
+     */
+    instr_set_raw_bits(bb->instr, bb->cur_pc, (uint)(next - copy_pc));
+    return bb->cur_pc + (next - copy_pc);
+
+decode_app_code:
+    /* The code could not be read (the app unmapped it, or the instruction extends
+     * onto an unreadable page), or the block is unusually long.  We decode the rest
+     * of the block from the app code as without a snapshot, which also delivers a
+     * fault on it to the app, and emitting copies the app code.
+     */
+    bb->selfmod_snapshot_failed = true;
+    return decode(dcontext, bb->cur_pc, bb->instr);
+}
+
+/* Points the raw bits of the block's app instructions at the snapshot, so that
+ * encoding copies the code that we decoded rather than the app code as it is when
+ * the block is emitted.  An instruction with a pc-relative operand is encoded from
+ * its operands instead, as re-relativizing raw bits takes their address for the
+ * instruction's app pc.  Call once the block is mangled: mangling takes the raw
+ * bits for the app address.
+ */
+static void
+bb_encode_from_selfmod_snapshot(build_bb_t *bb)
+{
+    instr_t *in;
+    if (bb->selfmod_snapshot == NULL || bb->selfmod_snapshot_failed ||
+        !TESTANY(FRAG_SELFMOD_SANDBOXED, bb->flags))
+        return;
+    for (in = instrlist_first(bb->ilist); in != NULL; in = instr_get_next(in)) {
+        byte *bits = instr_get_raw_bits(in);
+        if (!instr_raw_bits_valid(in) || TESTANY(INSTR_RAW_BITS_ALLOCATED, in->flags) ||
+            bits < bb->start_pc || bits + in->length > bb->end_pc)
+            continue;
+        if (instr_operands_valid(in) && instr_get_rel_data_or_instr_target(in, NULL))
+            instr_set_raw_bits_valid(in, false);
+        else
+            in->bytes = bb->selfmod_snapshot + (bits - bb->start_pc);
+    }
+}
+#endif /* X86 */
+
+/* Returns the pc after the app instruction at pc, read from the snapshot if the
+ * block is decoded from one.
+ */
+static app_pc
+bb_decode_next_app_pc(dcontext_t *dcontext, build_bb_t *bb, app_pc pc)
+{
+#ifdef X86
+    if (bb->selfmod_snapshot != NULL && !bb->selfmod_snapshot_failed &&
+        pc >= bb->start_pc && pc < bb->start_pc + bb->selfmod_snapshot_len) {
+        byte *copy_pc = bb->selfmod_snapshot + (pc - bb->start_pc);
+        byte *next = decode_next_pc(dcontext, copy_pc);
+        if (next != NULL && next <= bb->selfmod_snapshot + bb->selfmod_snapshot_len)
+            return pc + (next - copy_pc);
+    }
+#endif
+    return decode_next_pc(dcontext, pc);
+}
+
+/* Returns the copy of its app code that the sandboxed block being built for tag
+ * was decoded from, and the copy's size in *size.  Returns NULL if the block was
+ * decoded from the app code itself.
+ */
+const byte *
+bb_build_selfmod_snapshot(dcontext_t *dcontext, app_pc tag, size_t *size)
+{
+#ifdef X86
+    build_bb_t *bb;
+    if (dcontext == GLOBAL_DCONTEXT || dcontext->bb_build_info == NULL)
+        return NULL;
+    bb = (build_bb_t *)dcontext->bb_build_info;
+    if (bb->start_pc != tag || bb->selfmod_snapshot == NULL ||
+        bb->selfmod_snapshot_failed || !TESTANY(FRAG_SELFMOD_SANDBOXED, bb->flags))
+        return NULL;
+    if (bb->end_pc <= bb->start_pc ||
+        (size_t)(bb->end_pc - bb->start_pc) > bb->selfmod_snapshot_len) {
+        /* We decode every instruction of the block from the snapshot. */
+        ASSERT_NOT_REACHED();
+        return NULL;
+    }
+    *size = bb->end_pc - bb->start_pc;
+    return bb->selfmod_snapshot;
+#else
+    return NULL;
+#endif
+}
+
 /* Pass bb to client, and afterward check for criteria we require and rescan for
  * eflags and other flags that might have changed.
  * Returns true normally; returns false to indicate "go native".
@@ -3077,7 +3288,7 @@ client_process_bb(dcontext_t *dcontext, build_bb_t *bb)
          * the length of the translation target
          */
         if (!adjusted_cur_pc) {
-            bb->cur_pc = decode_next_pc(dcontext, xl8);
+            bb->cur_pc = bb_decode_next_app_pc(dcontext, bb, xl8);
             LOG(THREAD, LOG_INTERP, 3, "setting cur_pc (for fall-through) to " PFX "\n",
                 bb->cur_pc);
         }
@@ -3351,6 +3562,7 @@ build_bb_ilist(dcontext_t *dcontext, build_bb_t *bb)
     if (TESTANY(FRAG_SELFMOD_SANDBOXED, bb->flags)) {
         bb->full_decode = true;
         bb->follow_direct = false;
+        IF_X86(bb_start_selfmod_snapshot(bb));
     }
     if (TESTANY(FRAG_HAS_TRANSLATION_INFO, bb->flags)) {
         bb->full_decode = true;
@@ -3388,8 +3600,14 @@ build_bb_ilist(dcontext_t *dcontext, build_bb_t *bb)
             bb->instr_start = bb->cur_pc;
             if (bb->full_decode) {
                 /* only going through this do loop once! */
-                bb->cur_pc = IF_AARCH64_ELSE(decode_with_ldstex,
-                                             decode)(dcontext, bb->cur_pc, bb->instr);
+#ifdef X86
+                if (bb->selfmod_snapshot != NULL && !bb->selfmod_snapshot_failed &&
+                    TESTANY(FRAG_SELFMOD_SANDBOXED, bb->flags))
+                    bb->cur_pc = bb_decode_selfmod_snapshot(dcontext, bb);
+                else
+#endif
+                    bb->cur_pc = IF_AARCH64_ELSE(decode_with_ldstex,
+                                                 decode)(dcontext, bb->cur_pc, bb->instr);
                 if (bb->record_translation)
                     instr_set_translation(bb->instr, bb->instr_start);
             } else {
@@ -3451,6 +3669,7 @@ build_bb_ilist(dcontext_t *dcontext, build_bb_t *bb)
                     ASSERT(is_first_instr);
                     bb->full_decode = true;
                     bb->follow_direct = false;
+                    IF_X86(bb_start_selfmod_snapshot(bb));
                     bb->cur_pc = bb->instr_start;
                     instr_reset(dcontext, bb->instr);
                     continue;
@@ -4416,6 +4635,7 @@ build_bb_ilist(dcontext_t *dcontext, build_bb_t *bb)
         build_bb_ilist(dcontext, bb);
         return;
     }
+    IF_X86(bb_encode_from_selfmod_snapshot(bb));
 }
 
 /* Call when about to throw exception or other drastic action in the
@@ -4443,6 +4663,7 @@ bb_build_abort(dcontext_t *dcontext, bool clean_vmarea, bool unlock)
              */
             check_thread_vm_area_abort(dcontext, &bb->vmlist, bb->flags);
         } /* else we were presumably called from vmarea so caller does cleanup */
+        IF_X86(bb_free_selfmod_snapshot(bb));
         if (unlock) {
             /* Assumption: bb building lock is held iff bb->for_cache,
              * and on a nested app bb build where !bb->for_cache we do keep the
@@ -5104,6 +5325,8 @@ exit_interp_build_bb(dcontext_t *dcontext, build_bb_t *bb)
 
     /* free the instrlist_t elements */
     instrlist_clear_and_destroy(dcontext, bb->ilist);
+    /* After the instrs, whose raw bits can point into it. */
+    IF_X86(bb_free_selfmod_snapshot(bb));
 }
 
 /* Interprets the application's instructions until the end of a basic
@@ -5151,6 +5374,7 @@ build_basic_block_fragment(dcontext_t *dcontext, app_pc start, uint initial_flag
             LOG(THREAD, LOG_INTERP, 2, "replacing built bb with native_exec bb\n");
             instrlist_clear_and_destroy(dcontext, bb.ilist);
             vm_area_destroy_list(dcontext, bb.vmlist);
+            IF_X86(bb_free_selfmod_snapshot(&bb));
             dcontext->bb_build_info = NULL;
             init_interp_build_bb(dcontext, &bb, start, initial_flags, for_trace,
                                  unmangled_ilist);

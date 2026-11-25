@@ -386,6 +386,8 @@ emit_fragment_common(dcontext_t *dcontext, app_pc tag, instrlist_t *ilist, uint 
     uint len;
     uint offset = 0;
     uint copy_sz = 0;
+    /* The app code a sandboxed block was decoded from, if not the app code itself. */
+    const byte *selfmod_snapshot = NULL;
     uint extra_jmp_padding_body = 0;
     uint extra_jmp_padding_stubs = 0;
     uint last_pad_offset = 0;
@@ -554,7 +556,12 @@ emit_fragment_common(dcontext_t *dcontext, app_pc tag, instrlist_t *ilist, uint 
          * the original full range can only result in a false positive selfmod
          * event, which is a performance issue only.
          */
-        end_bb_pc = find_app_bb_end(dcontext, tag, flags);
+        size_t snapshot_size;
+        selfmod_snapshot = bb_build_selfmod_snapshot(dcontext, tag, &snapshot_size);
+        if (selfmod_snapshot != NULL)
+            end_bb_pc = tag + snapshot_size;
+        else
+            end_bb_pc = find_app_bb_end(dcontext, tag, flags);
         ASSERT(end_bb_pc > tag);
         ASSERT_TRUNCATE(copy_sz, uint, (ptr_uint_t)(end_bb_pc - tag) + sizeof(uint));
         copy_sz = (uint)(end_bb_pc - tag) + sizeof(uint);
@@ -714,7 +721,8 @@ emit_fragment_common(dcontext_t *dcontext, app_pc tag, instrlist_t *ilist, uint 
                (PAD_FRAGMENT_JMPS(flags) &&
                 !INTERNAL_OPTION(pad_jmps_return_excess_padding)));
         /* size is stored at the end, but included in copy_sz */
-        memcpy(vmcode_get_writable_addr(copy_pc), tag, copy_sz - sizeof(uint));
+        memcpy(vmcode_get_writable_addr(copy_pc),
+               selfmod_snapshot != NULL ? selfmod_snapshot : tag, copy_sz - sizeof(uint));
         *((uint *)vmcode_get_writable_addr(copy_pc + copy_sz - sizeof(uint))) = copy_sz;
         /* count copy as part of fragment */
         pc = copy_pc + copy_sz;

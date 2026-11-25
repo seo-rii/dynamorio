@@ -6295,6 +6295,9 @@ if (UNIX)
       tobuild_ops(linux.ibl-delete-race linux/ibl-delete-race.c
         "-disable_traces -slowdown_ibl_found 20000" "")
       link_with_pthread(linux.ibl-delete-race)
+      tobuild_ops(linux.selfmod-patch-race linux/selfmod-patch-race.c
+        "-sandbox_writable" "")
+      link_with_pthread(linux.selfmod-patch-race)
       tobuild(linux.signal-flush-race linux/signal-flush-race.c)
       link_with_pthread(linux.signal-flush-race)
     endif ()
