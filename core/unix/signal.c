@@ -7414,9 +7414,9 @@ receive_pending_signal(dcontext_t *dcontext)
         }
     }
     /* Only one signal can be delivered ignoring the back-in-dispatch blocked set. */
-    for (int i = 1; i <= MAX_SIGNUM; i++) {
-        if (info->sigpending[i] != NULL && info->sigpending[i]->unblocked_at_receipt)
-            info->sigpending[i]->unblocked_at_receipt = false;
+    for (sig = 1; sig <= MAX_SIGNUM; sig++) {
+        if (info->sigpending[sig] != NULL && info->sigpending[sig]->unblocked_at_receipt)
+            info->sigpending[sig]->unblocked_at_receipt = false;
     }
     /* barrier to prevent compiler from moving the below write above the loop */
     __asm__ __volatile__("" : : : "memory");
