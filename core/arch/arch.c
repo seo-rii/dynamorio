@@ -1531,8 +1531,20 @@ protect_generated_code(generated_code_t *code_in, bool writable)
             code->writable = writable;
         }
         STATS_INC(gencode_prot_changes);
-        change_protection(vmcode_get_writable_addr(genstart),
-                          code->commit_end_pc - genstart, writable);
+#ifdef UNIX
+        /* We know the protection of our own generated code, so we do not use
+         * change_protection(): it first queries the current protection, which on
+         * Linux reads /proc/self/maps.  Each flush gets here four times, via
+         * unlink_special_ibl_xfer() and link_special_ibl_xfer().  With
+         * -satisfy_w_xor_x the change is to the separate writable view instead.
+         */
+        if (!DYNAMO_OPTION(satisfy_w_xor_x)) {
+            set_protection(genstart, code->commit_end_pc - genstart,
+                           MEMPROT_READ | MEMPROT_EXEC | (writable ? MEMPROT_WRITE : 0));
+        } else
+#endif
+            change_protection(vmcode_get_writable_addr(genstart),
+                              code->commit_end_pc - genstart, writable);
         if (writable) {
             ASSERT(!code->writable);
             code->writable = writable;
