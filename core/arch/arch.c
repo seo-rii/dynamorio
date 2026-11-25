@@ -266,11 +266,9 @@ move_to_start_of_cache_line(dr_isa_mode_t isa_mode, byte *pc)
 /* The real size of generated code we need varies by cache line size and
  * options like inlining of ibl code.  We also generate different routines
  * for thread-private and thread-shared.  So, we dynamically extend the size
- * as we generate.  Currently our max is under 6 pages: with -coarse_units
- * on a host with AVX-512, keeping the tag of an IBL hit for target_delete
- * takes a little more than 5.
+ * as we generate.  Currently our max is under 5 pages.
  */
-#define GENCODE_RESERVE_SIZE (6 * PAGE_SIZE)
+#define GENCODE_RESERVE_SIZE (5 * PAGE_SIZE)
 
 #define GENCODE_COMMIT_SIZE \
     ((size_t)(ALIGN_FORWARD(sizeof(generated_code_t), PAGE_SIZE) + PAGE_SIZE))
