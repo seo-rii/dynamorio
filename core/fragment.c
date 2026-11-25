@@ -2968,6 +2968,11 @@ fragment_delete(dcontext_t *dcontext, fragment_t *f, uint actions)
 {
     bool acquired_shared_vm_lock = false;
     bool acquired_fragdel_lock = false;
+#ifdef UNIX
+    /* The signal handler may hold f to re-link it when the signal is delivered. */
+    if (dcontext != GLOBAL_DCONTEXT)
+        signal_forget_deleted_fragment(dcontext, f);
+#endif
     LOG(THREAD, LOG_FRAGMENT, 3,
         "fragment_delete: *" PFX " F%d(" PFX ")." PFX " %s 0x%x\n", f, f->id, f->tag,
         f->start_pc, TESTANY(FRAG_IS_TRACE, f->flags) ? "trace" : "bb", actions);
@@ -3059,7 +3064,7 @@ fragment_delete(dcontext_t *dcontext, fragment_t *f, uint actions)
      * hashtable_fragment_reset().  If we add any further conditions on when it should
      * be invoked we should keep the two calls in synch.
      */
-    if (dr_fragment_deleted_hook_exists() &&
+    if (dr_fragment_deleted_hook_exists() && !TESTANY(FRAGDEL_NO_CLIENT_EVENT, actions) &&
         (!TESTANY(FRAGDEL_NO_HEAP, actions) || !TESTANY(FRAGDEL_NO_FCACHE, actions)))
         instrument_fragment_deleted(dcontext, f->tag, f->flags);
 #ifdef UNIX
@@ -5227,25 +5232,40 @@ fragment_self_write(dcontext_t *dcontext)
         dcontext->last_fragment->tag,
         EXIT_CTI_PC(dcontext->last_fragment, dcontext->last_exit));
     STATS_INC(num_self_writes);
+#ifdef PROGRAM_SHEPHERDING
+    /* we can't call fragment_delete if vm_area_t deletes it by flushing */
+    if (!TESTANY(FRAG_WAS_DELETED, dcontext->last_fragment->flags) &&
+        vm_area_fragment_self_write(dcontext, dcontext->last_fragment->tag))
+        return;
+#endif
+    /* We are nolinking, so a flusher takes us to be at a safe point and can be
+     * unlinking our fragments right now, this one included, which also allocates
+     * from our heap.  It holds our linking lock while it does: we hold it while we
+     * check for that and delete.  The client's deletion event can call routines
+     * that take that lock (dr_app_pc_from_cache_pc(), for example), so we invoke
+     * it after releasing the lock.  It gets only the tag and flags.
+     */
+    per_thread_t *pt = (per_thread_t *)dcontext->fragment_field;
+    app_pc deleted_tag = NULL;
+    uint deleted_flags = 0;
+    d_r_mutex_lock(&pt->linking_lock);
     if (TESTANY(FRAG_WAS_DELETED, dcontext->last_fragment->flags)) {
         /* Case 8177: case 3559 unionized fragment_t.in_xlate, so we cannot delete a
          * fragment that has already been unlinked in the first stage of a flush.
          * The flush queue check, which comes after this (b/c we want to be
          * nolinking), will delete.
          */
-        ASSERT(((per_thread_t *)dcontext->fragment_field)->flush_queue_nonempty);
+        ASSERT(pt->flush_queue_nonempty);
         STATS_INC(num_self_writes_after_flushes);
     } else {
-#ifdef PROGRAM_SHEPHERDING
-        /* we can't call fragment_delete if vm_area_t deletes it by flushing */
-        if (!vm_area_fragment_self_write(dcontext, dcontext->last_fragment->tag)) {
-#endif
-            fragment_delete(dcontext, dcontext->last_fragment, FRAGDEL_ALL);
-            STATS_INC(num_fragments_deleted_selfmod);
-#ifdef PROGRAM_SHEPHERDING
-        }
-#endif
+        deleted_tag = dcontext->last_fragment->tag;
+        deleted_flags = dcontext->last_fragment->flags;
+        fragment_delete(dcontext, dcontext->last_fragment, FRAGDEL_NO_CLIENT_EVENT);
+        STATS_INC(num_fragments_deleted_selfmod);
     }
+    d_r_mutex_unlock(&pt->linking_lock);
+    if (deleted_tag != NULL && dr_fragment_deleted_hook_exists())
+        instrument_fragment_deleted(dcontext, deleted_tag, deleted_flags);
 }
 
 /* coarse_grain says to use just the min_pc and max_pc of f.
@@ -5414,6 +5434,10 @@ check_flush_queue(dcontext_t *dcontext, fragment_t *was_I_flushed)
     per_thread_t *pt = (per_thread_t *)dcontext->fragment_field;
     bool not_flushed = true;
     ASSERT_OWN_MUTEX(true, &pt->linking_lock);
+#ifdef UNIX
+    /* We are about to free flushed fragments, or to give up our claim on them. */
+    signal_forget_flushed_fragment(dcontext);
+#endif
     /* first check private queue and act on pending deletions */
     if (pt->flush_queue_nonempty) {
         bool local_prot = local_heap_protected(dcontext);
@@ -5751,6 +5775,33 @@ enter_nolinking(dcontext_t *dcontext, fragment_t *was_I_flushed, bool cache_tran
     }
 
     return not_flushed;
+}
+
+/* For a thread that changes the links of a fragment it has not left, such as
+ * from a signal handler that interrupted the code cache.  A flusher holds this
+ * lock while it unlinks our fragments, so holding it keeps the two apart.
+ * Such a thread must not use enter_couldbelinking() and enter_nolinking()
+ * instead: those are synch points for flushing, which delete the fragments on
+ * the thread's flush queue and release its references to pending shared
+ * deletions, and the thread may be about to resume one of those fragments.
+ */
+void
+acquire_linking_lock_in_fragment(dcontext_t *dcontext)
+{
+    per_thread_t *pt = (per_thread_t *)dcontext->fragment_field;
+    if (RUNNING_WITHOUT_CODE_CACHE() /*case 7966: has no pt*/ || pt == NULL)
+        return;
+    d_r_mutex_lock(&pt->linking_lock);
+    ASSERT(!pt->could_be_linking);
+}
+
+void
+release_linking_lock_in_fragment(dcontext_t *dcontext)
+{
+    per_thread_t *pt = (per_thread_t *)dcontext->fragment_field;
+    if (RUNNING_WITHOUT_CODE_CACHE() /*case 7966: has no pt*/ || pt == NULL)
+        return;
+    d_r_mutex_unlock(&pt->linking_lock);
 }
 
 /* Returns false iff was_I_flushed ends up being deleted */

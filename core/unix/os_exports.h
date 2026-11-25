@@ -519,6 +519,10 @@ kernel_sigismember(kernel_sigset_t *set, int _sig)
 
 void
 receive_pending_signal(dcontext_t *dcontext);
+void
+signal_forget_flushed_fragment(dcontext_t *dcontext);
+void
+signal_forget_deleted_fragment(dcontext_t *dcontext, fragment_t *f);
 bool
 is_signal_restorer_code(byte *pc, size_t *len);
 bool
@@ -571,6 +575,9 @@ create_clone_record(dcontext_t *dcontext, reg_t *app_thread_xsp,
 create_clone_record(dcontext_t *dcontext, reg_t *app_thread_xsp);
 #endif
 
+uint64
+get_clone_record_flags(void *record);
+
 #ifdef MACOS
 void *
 get_clone_record_thread_arg(void *record);
@@ -584,6 +591,9 @@ void
 signal_prepare_clone_child(void *clone_record);
 void
 signal_finish_clone_child(dcontext_t *dcontext, void *clone_record);
+/* No child was created; caller holds thread_initexit_lock. */
+void
+destroy_failed_clone_record(dcontext_t *dcontext, void *clone_record);
 #endif
 reg_t
 get_clone_record_app_xsp(void *record);

@@ -2720,6 +2720,16 @@ os_thread_init_finalize(dcontext_t *dcontext, void *os_data)
      * thread_initexit_lock (i#2779).
      */
     signal_thread_inherit(dcontext, os_data);
+#ifdef LINUX
+    /* The parent reclaims a vfork child when its vfork returns (see
+     * cleanup_after_vfork_execve()).  On Mac the vfork result is a pid, which
+     * finds no thread, so its vfork children are swept like other clones.
+     */
+    if (os_data != NULL) {
+        dcontext->thread_record->vfork_child =
+            TESTANY(CLONE_VFORK, get_clone_record_flags(os_data));
+    }
+#endif
 }
 
 void
@@ -2956,6 +2966,41 @@ os_new_thread_pre(void)
     wait_for_event(dr_attach_finished, 0);
     ATOMIC_INC(int, uninit_thread_count);
 }
+
+#ifdef LINUX
+/* Called only in the parent, after DR and private-library TLS are restored.
+ * A successful child owns its stack and may already have exited: do not
+ * dereference the saved record in that case.
+ */
+static void
+os_new_thread_post(dcontext_t *dcontext, bool success)
+{
+    void *record = dcontext->pending_clone_record;
+    ASSERT(record != NULL);
+    dcontext->pending_clone_record = NULL;
+    if (!success) {
+        d_r_mutex_lock(&thread_initexit_lock);
+        destroy_failed_clone_record(dcontext, record);
+        ASSERT(uninit_thread_count > 0);
+        ATOMIC_DEC(int, uninit_thread_count);
+        d_r_mutex_unlock(&thread_initexit_lock);
+    }
+}
+
+/* Serialize publication with abortable synch-all's suspend decision.  This must
+ * run with DR TLS, before os_clone_pre() on entry and after its restoration on
+ * return.  Child initialization does not end the parent's kernel vfork wait.
+ */
+static void
+set_vfork_in_progress(dcontext_t *dcontext, bool in_progress)
+{
+    ASSERT(!is_couldbelinking(dcontext));
+    d_r_mutex_lock(&thread_initexit_lock);
+    ASSERT(dcontext->vfork_in_progress != in_progress);
+    dcontext->vfork_in_progress = in_progress;
+    d_r_mutex_unlock(&thread_initexit_lock);
+}
+#endif
 
 /* This is called from pre_system_call() and before cloning a client thread in
  * dr_create_client_thread. Hence os_clone_pre is used for app threads as well
@@ -6525,13 +6570,10 @@ handle_execve(dcontext_t *dcontext)
      * SYS_execve: but execve seems more likely to fail than termination
      * syscalls.  Our solution is to mark this thread as "execve" and hide it
      * from regular thread queries; we clean it up in the process-exiting
-     * synch_with_thread(), or if the same parent thread performs another vfork
-     * (to prevent heap accumulation from repeated vfork+execve).  Since vfork
-     * on linux suspends the parent, there cannot be any races with the execve
-     * syscall completing: there can't even be peer vfork threads, so we could
-     * set a flag and clean up in d_r_dispatch, but that seems overkill.  (If vfork
-     * didn't suspend the parent we'd need to touch a marker file or something
-     * to know the execve was finished.)
+     * synch_with_thread(), or when the same parent thread returns from the
+     * vfork syscall.  Only that parent is suspended by Linux: other application
+     * threads can concurrently create their own vfork children.  They must not
+     * reclaim this thread merely because it has reached this execve marker.
      */
     mark_thread_execve(dcontext->thread_record, true);
 
@@ -6660,24 +6702,24 @@ handle_execve_post(dcontext_t *dcontext)
     }
 }
 
-/* i#237/PR 498284: to avoid accumulation of thread state we clean up a vfork
- * child who invoked execve here so we have at most one outstanding thread.  we
- * also clean up at process exit and before thread creation.  we could do this
- * in d_r_dispatch but too rare to be worth a flag check there.
+/* i#1010: Reclaims children that called execve but were not created with
+ * CLONE_VFORK, before the numbers of their private fds are reused.  No parent
+ * waits for them, and we cannot tell when their execve has reached the kernel:
+ * one still in handle_execve() is reclaimed too, as it always was.  A vfork
+ * child is reclaimed only by its parent (cleanup_after_vfork_execve()).
  */
 static void
-cleanup_after_vfork_execve(dcontext_t *dcontext)
+cleanup_after_clone_execve(dcontext_t *dcontext)
 {
     thread_record_t **threads;
     int num_threads, i;
     if (num_execve_threads == 0)
         return;
-
     d_r_mutex_lock(&thread_initexit_lock);
     get_list_of_threads_ex(&threads, &num_threads, true /*include execve*/);
     for (i = 0; i < num_threads; i++) {
-        if (threads[i]->execve) {
-            LOG(THREAD, LOG_SYSCALLS, 2, "cleaning up earlier vfork thread " TIDFMT "\n",
+        if (threads[i]->execve && !threads[i]->vfork_child) {
+            LOG(THREAD, LOG_SYSCALLS, 2, "cleaning up earlier clone thread " TIDFMT "\n",
                 threads[i]->id);
             dynamo_other_thread_exit(threads[i]);
         }
@@ -6685,6 +6727,27 @@ cleanup_after_vfork_execve(dcontext_t *dcontext)
     d_r_mutex_unlock(&thread_initexit_lock);
     global_heap_free(threads,
                      num_threads * sizeof(thread_record_t *) HEAPACCT(ACCT_THREAD_MGT));
+}
+
+/* Reclaim only the child whose CLONE_VFORK syscall has returned to this
+ * parent.  Linux releases that parent only after the child has relinquished
+ * the shared address space through execve or exit.  An execve marker alone is
+ * insufficient: a different parent thread may still have a vfork child in
+ * handle_execve(), before the kernel has even received the execve syscall.
+ */
+static void
+cleanup_after_vfork_execve(dcontext_t *dcontext, thread_id_t child_id)
+{
+    thread_record_t *child;
+    d_r_mutex_lock(&thread_initexit_lock);
+    child = thread_lookup(child_id);
+    if (child != NULL && child->execve) {
+        ASSERT(child != dcontext->thread_record);
+        LOG(THREAD, LOG_SYSCALLS, 2, "cleaning up completed vfork thread " TIDFMT "\n",
+            child_id);
+        dynamo_other_thread_exit(child);
+    }
+    d_r_mutex_unlock(&thread_initexit_lock);
 }
 
 /* XXX: Discover libc type at runtime and use appropriate stdfile_t variant
@@ -6789,14 +6852,6 @@ handle_close_pre(dcontext_t *dcontext)
     return handle_close_generic_pre(dcontext, (uint)sys_param(dcontext, 0),
                                     true /*set_return_val*/);
 }
-
-#ifdef SYS_close_range
-static bool
-handle_close_range_pre(dcontext_t *dcontext, file_t fd)
-{
-    return handle_close_generic_pre(dcontext, fd, false /*set_return_val*/);
-}
-#endif
 
 /***************************************************************************/
 
@@ -7319,7 +7374,7 @@ handle_clone_pre(dcontext_t *dcontext)
      * XXX: Ideally we'd do this in fd_table_add(), but we can't acquire
      * thread_initexit_lock there.
      */
-    cleanup_after_vfork_execve(dcontext);
+    cleanup_after_clone_execve(dcontext);
 
     /* For thread creation clone syscalls a clone_record_t structure
      * containing the pc after the app's syscall instr and other data
@@ -7329,6 +7384,7 @@ handle_clone_pre(dcontext_t *dcontext)
      * Note: This must be done after sys_param0 is set.
      */
     if (is_thread_create_syscall(dcontext, dr_clone_args)) {
+        ASSERT(dcontext->pending_clone_record == NULL);
         if (dcontext->sys_num == SYS_clone3) {
             /* create_clone_record modifies some fields in clone_args for the
              * clone3 syscall. Instead of reusing the app's copy of
@@ -7351,7 +7407,8 @@ handle_clone_pre(dcontext_t *dcontext)
             *sys_param_addr(dcontext, SYSCALL_PARAM_CLONE3_CLONE_ARGS) =
                 (reg_t)dr_clone_args;
             /* The pointer to the app's clone_args was saved in sys_param0 above. */
-            create_clone_record(dcontext, NULL, dr_clone_args, app_clone_args);
+            dcontext->pending_clone_record =
+                create_clone_record(dcontext, NULL, dr_clone_args, app_clone_args);
         } else {
             /* We replace the app-provided stack pointer with our own stack
              * pointer in create_clone_record. Save the original pointer so
@@ -7359,10 +7416,12 @@ handle_clone_pre(dcontext_t *dcontext)
              * restored in the child in restore_clone_param_from_clone_record.
              */
             dcontext->sys_param1 = sys_param(dcontext, SYSCALL_PARAM_CLONE_STACK);
-            create_clone_record(dcontext,
-                                sys_param_addr(dcontext, SYSCALL_PARAM_CLONE_STACK), NULL,
-                                NULL);
+            dcontext->pending_clone_record = create_clone_record(
+                dcontext, sys_param_addr(dcontext, SYSCALL_PARAM_CLONE_STACK), NULL,
+                NULL);
         }
+        if (TESTANY(CLONE_VFORK, flags))
+            set_vfork_in_progress(dcontext, true);
         os_clone_pre(dcontext);
         os_new_thread_pre();
     } else {
@@ -7579,6 +7638,24 @@ pre_system_call(dcontext_t *dcontext)
         }
         pre_mapping_handle_sharedness_change(
             dcontext, addr, len, TESTANY(MAP_FIXED, flags), TESTANY(MAP_SHARED, flags));
+        /* A fixed mapping replaces whatever is mapped there, as an unmap followed by
+         * a map would.  For code we have fragments of, those must go: flush them
+         * now, as for an unmap, and once more after the system call, for fragments
+         * that another thread builds from the old code in between.  We leave a
+         * library's segments alone: they are mapped over its initial mapping before
+         * any of its code runs.
+         */
+        dcontext->sys_param4 = 0;
+        if (addr != NULL && TESTANY(MAP_FIXED, flags) && !image &&
+            executable_vm_area_overlap((app_pc)addr, (app_pc)addr + len,
+                                       false /*no lock*/)) {
+            LOG(THREAD, LOG_SYSCALLS, 2, "\tfixed mmap over code " PFX "-" PFX "\n", addr,
+                (app_pc)addr + len);
+            flush_fragments_and_remove_region(dcontext, (app_pc)addr, len,
+                                              false /* don't own initexit_lock */,
+                                              false /* keep futures */);
+            dcontext->sys_param4 = 1;
+        }
         /* post_system_call does the work */
         dcontext->sys_param0 = (reg_t)addr;
         dcontext->sys_param1 = len;
@@ -7723,9 +7800,13 @@ pre_system_call(dcontext_t *dcontext)
         new_memprot = osprot_to_memprot(prot) |
             /* mprotect won't change meta flags */
             (old_memprot & MEMPROT_META_FLAGS);
+        /* Paired with app_memory_protection_change_done() in post_system_call(). */
+        app_memory_protection_change_start(dcontext, addr, len, old_memprot, new_memprot);
         res = app_memory_protection_change(dcontext, addr, len, new_memprot, &new_memprot,
                                            NULL, false /*!image*/);
         if (res != DO_APP_MEM_PROT_CHANGE) {
+            app_memory_protection_change_done(dcontext, addr, len, new_memprot,
+                                              false /*!success*/);
             if (res == FAIL_APP_MEM_PROT_CHANGE) {
                 ASSERT_NOT_IMPLEMENTED(false); /* return code? */
             } else {
@@ -7838,7 +7919,7 @@ pre_system_call(dcontext_t *dcontext)
         uint flags = CLONE_VFORK | CLONE_VM | SIGCHLD;
         LOG(THREAD, LOG_SYSCALLS, 2, "syscall: vfork\n");
         handle_clone(dcontext, flags);
-        cleanup_after_vfork_execve(dcontext);
+        cleanup_after_clone_execve(dcontext);
 
         /* save for post_system_call, treated as if SYS_clone */
         dcontext->sys_param0 = (reg_t)flags;
@@ -7851,9 +7932,11 @@ pre_system_call(dcontext_t *dcontext)
 #    ifdef MACOS
         create_clone_record(dcontext, (reg_t *)&mc->xsp, NULL, NULL);
 #    else
-        create_clone_record(dcontext, (reg_t *)&mc->xsp /*child uses parent sp*/, NULL,
-                            NULL);
+        ASSERT(dcontext->pending_clone_record == NULL);
+        dcontext->pending_clone_record = create_clone_record(
+            dcontext, (reg_t *)&mc->xsp /*child uses parent sp*/, NULL, NULL);
 #    endif
+        IF_LINUX(set_vfork_in_progress(dcontext, true));
         os_clone_pre(dcontext);
         os_new_thread_pre();
         break;
@@ -8326,67 +8409,69 @@ pre_system_call(dcontext_t *dcontext)
 #endif
 #ifdef SYS_close_range
     case SYS_close_range: {
-        /* client.file_io indeed tests this for all arch, but it hasn't yet been
-         * run on an AArchXX machine that has close_range available.
-         */
-        IF_AARCHXX(ASSERT_NOT_TESTED());
         uint first_fd = sys_param(dcontext, 0), last_fd = sys_param(dcontext, 1);
         uint flags = sys_param(dcontext, 2);
         bool is_cloexec = TESTANY(CLOSE_RANGE_CLOEXEC, flags);
-        if (is_cloexec) {
-            /* client.file_io has a test for CLOSE_RANGE_CLOEXEC, but it hasn't been
-             * verified on a system with kernel version >= 5.11 yet.
-             */
-            ASSERT_NOT_TESTED();
-        }
-        /* We do not let the app execute their own close_range ever. Instead we
-         * make multiple close_range syscalls ourselves, one for each contiguous
-         * sub-range of non-DR-private fds in [first, last].
-         */
+        ptr_int_t ret;
+        uint64 cursor, closed_end = first_fd;
         execute_syscall = false;
         if (first_fd > last_fd) {
             set_failure_return_val(dcontext, EINVAL);
             DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
             break;
         }
-        uint cur_range_first_fd = 0;
-        uint cur_range_last_fd = 0;
-        bool cur_range_valid = false;
-        int ret = 0;
-        for (int i = first_fd; i <= last_fd; i++) {
-            /* Do not allow any changes to DR-owned FDs. */
-            if ((is_cloexec && fd_is_dr_owned(i)) ||
-                (!is_cloexec && !handle_close_range_pre(dcontext, i))) {
-                SYSLOG_INTERNAL_WARNING_ONCE("app trying to close private fd(s)");
-                if (cur_range_valid) {
-                    cur_range_valid = false;
-                    ret = dynamorio_syscall(SYS_close_range, 3, cur_range_first_fd,
-                                            cur_range_last_fd, flags);
+        /* Validate all flags in the kernel before touching any descriptor.
+         * UINT_MAX is outside Linux's signed-int descriptor domain. This also
+         * performs UNSHARE once, including when the range contains only private
+         * descriptors. Repeating UNSHARE for each split range is unnecessary.
+         */
+        ret = dynamorio_syscall(SYS_close_range, 3, UINT_MAX, UINT_MAX, flags);
+        if (ret == 0) {
+            flags &= ~CLOSE_RANGE_UNSHARE;
+            if (!is_cloexec) {
+                if (first_fd == 0)
+                    handle_close_generic_pre(dcontext, STDIN, false);
+                if (first_fd <= STDOUT && last_fd >= STDOUT)
+                    handle_close_generic_pre(dcontext, STDOUT, false);
+                if (first_fd <= STDERR && last_fd >= STDERR)
+                    handle_close_generic_pre(dcontext, STDERR, false);
+            }
+            /* Work is bounded by the number of private descriptors, not the
+             * numeric size of the range (which is commonly [3, UINT_MAX]).
+             * Keep the table locked so a new client file cannot appear inside
+             * a range while it is being closed by the kernel.
+             */
+            TABLE_RWLOCK(fd_table, read, lock);
+            cursor = first_fd;
+            while (cursor <= last_fd) {
+                ptr_uint_t key;
+                uint64 next = (uint64)last_fd + 1;
+                int iter = 0;
+                while ((iter = generic_hash_iterate_next(GLOBAL_DCONTEXT, fd_table, iter,
+                                                         &key, NULL)) >= 0) {
+                    if (key >= cursor && key < next)
+                        next = key;
+                }
+                if (cursor < next) {
+                    ret = dynamorio_syscall(SYS_close_range, 3, (uint)cursor,
+                                            (uint)(next - 1), flags);
                     if (ret != 0)
                         break;
+                    closed_end = next;
                 }
-            } else {
-#    ifdef LINUX
-                if (!is_cloexec) {
-                    signal_handle_close(dcontext, i);
-                }
-#    endif
-                if (cur_range_valid) {
-                    ASSERT(cur_range_last_fd == i - 1);
-                    cur_range_last_fd = i;
-                } else {
-                    cur_range_first_fd = i;
-                    cur_range_last_fd = i;
-                    cur_range_valid = true;
-                }
+                cursor = next + 1;
             }
-        }
-        if (cur_range_valid) {
-            ret = dynamorio_syscall(SYS_close_range, 3, cur_range_first_fd,
-                                    cur_range_last_fd, flags);
+            TABLE_RWLOCK(fd_table, read, unlock);
+#    ifdef LINUX
+            /* Releasing a signalfd can close its protected backing pipes, so
+             * this must run after releasing fd_table (lock order).
+             */
+            if (!is_cloexec && closed_end > first_fd)
+                signal_handle_close_range(dcontext, first_fd, (uint)(closed_end - 1));
+#    endif
         }
         if (ret != 0) {
-            set_failure_return_val(dcontext, ret);
+            set_failure_return_val(dcontext, -ret);
             DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
         } else {
             set_success_return_val(dcontext, 0);
@@ -9287,6 +9372,15 @@ post_system_call(dcontext_t *dcontext)
             prot = (uint)dcontext->sys_param2;
             flags = (uint)dcontext->sys_param3;
             DEBUG_DECLARE(map_type = IF_X64_ELSE("mmap2", "mmap");)
+            if (dcontext->sys_param4 != 0 &&
+                executable_vm_area_overlap(base, base + size, false /*no lock*/)) {
+                /* See pre_system_call(): another thread ran the old code between
+                 * our flush and the system call, and built fragments from it.
+                 */
+                flush_fragments_and_remove_region(dcontext, base, size,
+                                                  false /* don't own initexit_lock */,
+                                                  false /* keep futures */);
+            }
 #if defined(LINUX) && !defined(X64) && !defined(ARM)
         }
 #endif
@@ -9372,6 +9466,8 @@ post_system_call(dcontext_t *dcontext)
         base = (app_pc)dcontext->sys_param0;
         size = dcontext->sys_param1;
         prot = dcontext->sys_param2;
+        app_memory_protection_change_done(dcontext, base, size, osprot_to_memprot(prot),
+                                          success);
 #ifdef VMX86_SERVER
         /* PR 475111: workaround for PR 107872 */
         if (os_in_vmkernel_userworld() && result == -EBUSY && prot == PROT_NONE) {
@@ -9497,9 +9593,16 @@ post_system_call(dcontext_t *dcontext)
          * The child thread's tls setup is done in os_tls_app_seg_init.
          */
         if (was_thread_create_syscall(dcontext)) {
+            /* Read clone3 flags before freeing DR's saved clone_args. */
+            bool was_vfork =
+                TESTANY(CLONE_VFORK,
+                        sysnum == SYS_clone3 ? get_stored_clone3_flags(dcontext)
+                                             : dcontext->sys_param0);
+            bool completed_vfork = success && result > 0 && was_vfork;
             if (INTERNAL_OPTION(private_loader))
                 os_switch_lib_tls(dcontext, false /*to dr*/);
             /* i#2089: we already restored the DR tls in os_clone_post() */
+            os_new_thread_post(dcontext, success);
 
             if (sysnum == SYS_clone3) {
                 /* Free DR's copy of clone_args and restore the pointer to the
@@ -9526,6 +9629,11 @@ post_system_call(dcontext_t *dcontext)
                 set_syscall_param(dcontext, SYSCALL_PARAM_CLONE_STACK,
                                   dcontext->sys_param1);
             }
+            if (completed_vfork)
+                cleanup_after_vfork_execve(dcontext, (thread_id_t)result);
+            /* A failed clone also releases the pre-syscall publication. */
+            if (was_vfork)
+                set_vfork_in_progress(dcontext, false);
         }
         break;
     }
@@ -9568,6 +9676,10 @@ post_system_call(dcontext_t *dcontext)
             }
             /* i#2089: we already restored the DR tls in os_clone_post() */
         }
+        IF_LINUX(os_new_thread_post(dcontext, success));
+        if (success && result > 0)
+            cleanup_after_vfork_execve(dcontext, (thread_id_t)result);
+        IF_LINUX(set_vfork_in_progress(dcontext, false));
         break;
     }
 #endif

@@ -1012,6 +1012,27 @@ signal_prepare_clone_child(void *clone_record)
         ASSERT(rc == 0);
     }
 }
+
+void
+destroy_failed_clone_record(dcontext_t *dcontext, void *clone_record)
+{
+    clone_record_t *record = (clone_record_t *)clone_record;
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    ASSERT_OWN_MUTEX(true, &thread_initexit_lock);
+    ASSERT(record->parent_info == info && record->caller_id == dcontext->owning_thread);
+    if (!TESTANY(CLONE_SIGHAND, record->clone_flags)) {
+        /* Undo only this unstarted child's reservation from handle_clone().
+         * Shared-handler and itimer references are acquired by the child,
+         * so a failed clone has no child reference to release.
+         */
+        d_r_mutex_lock(&info->child_lock);
+        ASSERT(info->num_unstarted_children > 0);
+        info->num_unstarted_children--;
+        d_r_mutex_unlock(&info->child_lock);
+    }
+    /* The record itself is embedded in this never-used child stack. */
+    stack_free(record->dstack, DYNAMORIO_STACK_SIZE);
+}
 #endif
 
 /* i#149/PR 403015: App xsp is passed to the new thread via the clone record. */
@@ -1020,6 +1041,13 @@ get_clone_record_app_xsp(void *record)
 {
     ASSERT(record != NULL);
     return ((clone_record_t *)record)->app_thread_xsp;
+}
+
+uint64
+get_clone_record_flags(void *record)
+{
+    ASSERT(record != NULL);
+    return ((clone_record_t *)record)->clone_flags;
 }
 
 #ifdef MACOS
@@ -4565,8 +4593,14 @@ unlink_fragment_for_signal(dcontext_t *dcontext, fragment_t *f,
      */
     bool changed = false;
     bool waslinking = is_couldbelinking(dcontext);
+    /* The thread resumes f without passing d_r_dispatch, so we must not go through
+     * enter_couldbelinking() and enter_nolinking() here: they act on the thread's
+     * flush queue, which can delete f, or release the thread's reference to f if f
+     * is a shared fragment that is pending deletion, and the thread would then
+     * resume freed code.
+     */
     if (!waslinking)
-        enter_couldbelinking(dcontext, NULL, false);
+        acquire_linking_lock_in_fragment(dcontext);
     /* may not be linked if trace_relink or something */
     if (TESTANY(FRAG_COARSE_GRAIN, f->flags)) {
         /* XXX PR 213040: we don't support unlinking coarse, so we try
@@ -4605,13 +4639,47 @@ unlink_fragment_for_signal(dcontext_t *dcontext, fragment_t *f,
             changed = true;
     }
     if (!waslinking)
-        enter_nolinking(dcontext, NULL, false);
+        release_linking_lock_in_fragment(dcontext);
     return changed;
+}
+
+/* A fragment that we unlinked for a signal can be flushed before we re-link it.
+ * It is not entered again, so there is nothing to restore, and it can be freed
+ * once this thread acts on its flush queue: the thread drops its pointer first.
+ */
+void
+signal_forget_flushed_fragment(dcontext_t *dcontext)
+{
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    if (info != NULL && info->interrupted != NULL &&
+        TESTANY(FRAG_WAS_DELETED, info->interrupted->flags)) {
+        LOG(THREAD, LOG_ASYNCH, 3, "\tinterrupted F%d was flushed: not re-linking\n",
+            info->interrupted->id);
+        info->interrupted = NULL;
+        info->interrupted_pc = NULL;
+    }
+}
+
+/* The thread itself can also delete the fragment we unlinked for a signal,
+ * without a flush: a sandboxed block that wrote to its own code, for example
+ * (fragment_self_write()).  Called from fragment_delete().
+ */
+void
+signal_forget_deleted_fragment(dcontext_t *dcontext, fragment_t *f)
+{
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    if (info != NULL && info->interrupted == f) {
+        LOG(THREAD, LOG_ASYNCH, 3, "\tinterrupted F%d is deleted: not re-linking\n",
+            f->id);
+        info->interrupted = NULL;
+        info->interrupted_pc = NULL;
+    }
 }
 
 static void
 relink_interrupted_fragment(dcontext_t *dcontext, thread_sig_info_t *info)
 {
+    signal_forget_flushed_fragment(dcontext);
     if (info->interrupted == NULL)
         return;
     /* i#2066: if we were building a trace, it may already be re-linked */
@@ -4934,6 +5002,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
     bool handled = false;
     bool reroute = false;
     bool at_auto_restart_syscall = false;
+    byte *pre_restart_xip = NULL;
     int syslen = 0;
     reg_t orig_retval_reg = sc->SC_RETURN_REG;
     sigpending_t *pend;
@@ -5152,6 +5221,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
                     "\n",
                     pc, pc + syslen);
                 at_auto_restart_syscall = true;
+                pre_restart_xip = (byte *)sc->SC_XIP;
                 sc->SC_XIP += syslen;
                 sc->SC_RETURN_REG = -EINTR;
                 pc = (byte *)sc->SC_XIP;
@@ -5190,6 +5260,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
          * existing sysenter restart mechanism.
          */
         at_auto_restart_syscall = true;
+        pre_restart_xip = (byte *)sc->SC_XIP;
         sc->SC_XIP = (reg_t)vsyscall_sysenter_return_pc;
         sc->SC_RETURN_REG = -EINTR;
         pc = (byte *)sc->SC_XIP;
@@ -5329,7 +5400,30 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
         /* Happened in DR, do not translate context.  Record for later processing
          * at a safe point with a clean app state.
          */
-        if (!blocked || sig >= OFFS_RT || (blocked && info->sigpending[sig] == NULL)) {
+        /* Queueing a signal when the pending-signal heap's first unit is full
+         * allocates a new unit, which is unsafe here: it acquires locks that the
+         * code we interrupted may hold.  When only one block is left we do not
+         * queue a standard signal that is already pending, which the kernel does
+         * not queue again either, and keep the block for a signal that is not.
+         */
+        int capacity = (int)DYNAMO_OPTION(max_pending_signals) *
+            /* receive_pending_signal() adds a second unit near the limit. */
+            (info->multiple_pending_units ? 2 : 1);
+        bool keep_last_block = sig < OFFS_RT && info->sigpending[sig] != NULL &&
+            info->num_pending + 1 >= capacity;
+        if (keep_last_block) {
+            STATS_INC(num_signals_dropped);
+            SYSLOG_INTERNAL_WARNING_ONCE("dropping already-pending standard signal");
+            if (at_auto_restart_syscall) {
+                /* No handler runs for this signal: let the kernel restart the
+                 * interrupted syscall instead of returning -EINTR to the app.
+                 */
+                sc->SC_XIP = (reg_t)pre_restart_xip;
+                sc->SC_RETURN_REG = orig_retval_reg;
+            }
+        }
+        if (!keep_last_block &&
+            (!blocked || sig >= OFFS_RT || (blocked && info->sigpending[sig] == NULL))) {
             /* only have 1 pending for blocked non-rt signals */
 
             /* To avoid accumulating signals if we're slow in presence of
@@ -7413,6 +7507,42 @@ receive_pending_signal(dcontext_t *dcontext)
         special_heap_free(info->sigheap, temp1);
         special_heap_free(info->sigheap, temp2);
         special_heap_free(info->sigheap, temp3);
+    }
+    /* A signal can interrupt an auto-restart syscall, after which another signal
+     * can arrive before we reach dispatch.  Pending signals are not necessarily
+     * delivered in arrival order.  Restore the interrupted syscall once, before
+     * delivering any of them: otherwise a later delivery can restore an old
+     * register/stack context after the application has already made progress.
+     *
+     * Keep signal selection and blocking unchanged.  In particular, a suppressed,
+     * ignored, or rerouted signal must not discard the syscall's restart.  The
+     * application has not run since the interrupted syscall, so there can be at
+     * most one such context.  FP state remains handled at delivery as before.
+     */
+    sigpending_t *restart = NULL;
+    for (int i = 1; i <= MAX_SIGNUM; i++) {
+        for (sigpending_t *pending = info->sigpending[i]; pending != NULL;
+             pending = pending->next) {
+            if (pending->use_sigcontext) {
+                ASSERT(restart == NULL);
+                if (restart == NULL)
+                    restart = pending;
+            }
+        }
+    }
+    if (restart != NULL) {
+        kernel_ucontext_t *uc = get_ucontext_from_rt_frame(&restart->rt_frame);
+        sigcontext_t *sc = SIGCXT_FROM_UCXT(uc);
+        sig_full_cxt_t sc_full;
+        sig_full_initialize(&sc_full, uc);
+        dcontext->next_tag = canonicalize_pc_target(dcontext, (app_pc)sc->SC_XIP);
+        /* Preserve the current application SIMD state.  The raw pending frame
+         * has not yet had save_fpstate() repair its state for delivery.
+         */
+        sigcontext_to_mcontext(get_mcontext(dcontext), &sc_full,
+                               DR_MC_INTEGER | DR_MC_CONTROL);
+        IF_ARM(dr_set_isa_mode(dcontext, get_pc_mode_from_cpsr(sc), NULL));
+        restart->use_sigcontext = false;
     }
     for (sig = 1; sig <= MAX_SIGNUM; sig++) {
         if (info->sigpending[sig] != NULL) {

@@ -1443,6 +1443,21 @@ synch_with_all_threads(thread_synch_state_t desired_synch_state,
                     threads[i]->dcontext->client_data->left_unsuspended = true;
                     continue;
                 }
+#ifdef LINUX
+                /* A CLONE_VFORK parent cannot handle our suspend signal until
+                 * its child leaves the shared address space.  That child may
+                 * need thread_initexit_lock or already be suspended by us.
+                 * Publication uses this same lock, so a parent cannot enter
+                 * vfork after a negative check while we retain the lock.
+                 * Only callers that permit abort use this path: mandatory
+                 * RETRY/IGNORE synchronization retains its existing behavior.
+                 */
+                if (TESTANY(THREAD_SYNCH_SUSPEND_FAILURE_ABORT, flags) &&
+                    threads[i]->dcontext->vfork_in_progress) {
+                    all_synched = false;
+                    goto synch_with_all_abort;
+                }
+#endif
                 /* speed things up a tad */
                 if (synch_array[i] != SYNCH_WITH_ALL_NOTIFIED) {
                     ASSERT(synch_array[i] == SYNCH_WITH_ALL_NEW);
@@ -1573,7 +1588,15 @@ synch_with_all_exit:
     *threads_out = threads;
     *num_threads_out = num_threads;
     dynamo_all_threads_synched = all_synched;
-    ASSERT(exiting_thread_count - expect_self_exiting == 0);
+    if (!all_synched && TESTANY(THREAD_SYNCH_SUSPEND_FAILURE_ABORT, flags)) {
+        /* Keep thread records alive through the metadata updates above even
+         * after abort has resumed their threads.  A failed synchronization
+         * need not have waited for all exiting threads.
+         */
+        d_r_mutex_unlock(&thread_initexit_lock);
+        d_r_mutex_unlock(&all_threads_synch_lock);
+    } else
+        ASSERT(exiting_thread_count - expect_self_exiting == 0);
     /* XXX case 9392: where on all_synch failure we do not release the locks in the
      * non-abort exit path */
     return all_synched;
@@ -1595,8 +1618,8 @@ synch_with_all_abort:
                     os_thread_resume(threads[i]);
                     ASSERT(ok);
                 }
-                /* ensure synch_with_success is set to false on exit path,
-                 * even though locks are released and not fully valid
+                /* The common exit marks resumed records unsuccessful while
+                 * thread_initexit_lock still protects their contexts.
                  */
                 synch_array[i] = SYNCH_WITH_ALL_NEW;
             } else if (synch_array[i] == SYNCH_WITH_ALL_NOTIFIED) {
@@ -1604,9 +1627,6 @@ synch_with_all_abort:
             }
         }
     }
-    d_r_mutex_unlock(&thread_initexit_lock);
-    d_r_mutex_unlock(&all_threads_synch_lock);
-    ASSERT(exiting_thread_count - expect_self_exiting == 0);
     ASSERT(!all_synched); /* ensure our OUT values will be NULL,0
                              for THREAD_SYNCH_SUSPEND_FAILURE_ABORT */
     goto synch_with_all_exit;
