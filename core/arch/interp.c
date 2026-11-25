@@ -5592,6 +5592,13 @@ recreate_fragment_ilist(dcontext_t *dcontext, byte *pc,
         }
     }
 
+    /* A write to the region of a flushed fragment can since have made the
+     * region self-modifying.  Rebuilding f against the region's current state
+     * would then sandbox it, and so also not share it: the result would not
+     * match the code f holds, and a fault in f could not be translated.  Rebuild
+     * f as it was built instead, without consulting its region again.
+     */
+    bool check_vm_area = !TESTANY(FRAG_WAS_DELETED, f->flags);
     /* Recreate in same mode as original fragment */
     DEBUG_DECLARE(bool ok =)
     dr_set_isa_mode(dcontext, FRAG_ISA_MODE(f->flags), &old_mode);
@@ -5601,7 +5608,7 @@ recreate_fragment_ilist(dcontext_t *dcontext, byte *pc,
         /* easy case: just a bb */
         ilist = recreate_bb_ilist(dcontext, (byte *)f->tag, (byte *)f->tag,
                                   NULL /*default stop*/, 0 /*no pre flags*/, &flags, NULL,
-                                  true /*check vm area*/, mangle, NULL, call_client,
+                                  check_vm_area, mangle, NULL, call_client,
                                   false /*not for_trace*/);
         ASSERT(ilist != NULL);
         if (ilist == NULL) /* a race */
@@ -5635,10 +5642,11 @@ recreate_fragment_ilist(dcontext_t *dcontext, byte *pc,
         for (i = 0; i < t->num_bbs; i++) {
             void *vmlist = NULL;
             apc = (byte *)t->bbs[i].tag;
-            bb = recreate_bb_ilist(
-                dcontext, apc, apc, NULL /*default stop*/, 0 /*no pre flags*/, &flags,
-                &md.final_exit_flags, true /*check vm area*/, !mangle_at_end,
-                (mangle_at_end ? &vmlist : NULL), call_client, true /*for_trace*/);
+            bb = recreate_bb_ilist(dcontext, apc, apc, NULL /*default stop*/,
+                                   0 /*no pre flags*/, &flags, &md.final_exit_flags,
+                                   check_vm_area, !mangle_at_end,
+                                   (mangle_at_end && check_vm_area ? &vmlist : NULL),
+                                   call_client, true /*for_trace*/);
             ASSERT(bb != NULL);
             if (bb == NULL) {
                 instrlist_clear_and_destroy(dcontext, ilist);
@@ -7182,9 +7190,11 @@ mangle_trace(dcontext_t *dcontext, instrlist_t *ilist, monitor_data_t *md)
 
         /* Clients should not add new source code regions, which would mess us up
          * here, as well as mess up our cache consistency (both page prot and
-         * selfmod).
+         * selfmod).  A flushed trace is recreated without consulting its regions
+         * (see recreate_fragment_ilist()), so its blocks have no region list to
+         * check: the check was made when the trace was built.
          */
-        if (md->pass_to_client &&
+        if (md->pass_to_client && md->blk_info[blk].vmlist != NULL &&
             (!vm_list_overlaps(dcontext, md->blk_info[blk].vmlist, xl8, xl8 + 1) &&
              !(instr_is_ubr(inst) && opnd_is_pc(instr_get_target(inst)) &&
                xl8 == opnd_get_pc(instr_get_target(inst))))

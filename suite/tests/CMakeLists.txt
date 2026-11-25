@@ -2926,6 +2926,14 @@ if (X86 OR AARCH64 OR RISCV64) # XXX i#1551: port asm to ARM
     tobuild_ci(client.flush client-interface/flush.c "" "" "")
   endif ()
 endif (X86 OR AARCH64 OR RISCV64)
+if (X86 AND X64 AND LINUX) # The test generates x86-64 code.
+  # A fault in a trace that a write to its page has just flushed, translated with
+  # a client.  Page protection, not sandboxing, keeps the code consistent here:
+  # sandboxed blocks do not become traces.
+  tobuild_ci(client.selfmod-fault-trace client-interface/selfmod-fault-trace.c ""
+    "-ro2sandbox_threshold 0" "")
+  link_with_pthread(client.selfmod-fault-trace)
+endif ()
 if (X86 OR AARCH64) # XXX i#1551: port asm to ARM
   tobuild_ci(client.strace client-interface/strace.c "" "" "")
   use_DynamoRIO_extension(client.strace.dll drmgr)
@@ -6263,6 +6271,13 @@ if (UNIX)
       set_avx_flags(linux.synchall-restore)
       link_with_pthread(linux.synchall-restore)
     endif ()
+    if (X86 AND X64)
+      # A fault in a block of generated code that a write to its page has just
+      # flushed, as at a JIT's safepoint poll.
+      tobuild_ops(linux.selfmod-fault linux/selfmod-fault.c
+        "-ro2sandbox_threshold 1 -sandbox2ro_threshold 2" "")
+      link_with_pthread(linux.selfmod-fault)
+    endif ()
 
     if (X86) # The test generates x86 code.
       # -slowdown_ibl_found takes effect only with internal options.
@@ -6272,6 +6287,14 @@ if (UNIX)
       tobuild_ops(linux.selfmod-patch-race linux/selfmod-patch-race.c
         "-sandbox_writable" "")
       link_with_pthread(linux.selfmod-patch-race)
+      tobuild(linux.signal-flush-race linux/signal-flush-race.c)
+      link_with_pthread(linux.signal-flush-race)
+    endif ()
+
+    # The race is detected by a consistency check in debug builds.
+    if (X86 AND DEBUG) # The test generates x86 code.
+      tobuild(linux.mprotect-code-race linux/mprotect-code-race.c)
+      link_with_pthread(linux.mprotect-code-race)
     endif ()
 
     if (NOT ANDROID)
@@ -6300,6 +6323,9 @@ if (UNIX)
   tobuild(linux.eintr linux/eintr.c)
   link_with_pthread(linux.eintr)
   torunonly(linux.eintr-noinline linux.eintr linux/eintr.c "-no_ignore_syscalls" "")
+  if (LINUX)
+    tobuild(linux.close_range linux/close_range.c)
+  endif ()
 
   if (NOT ANDROID AND NOT RISCV64) # XXX i#1874: get working on Android
     # TODO i#3544: Port tests to RISC-V 64
@@ -6382,6 +6408,9 @@ if (UNIX)
     # TODO i#3544: Port tests to RISC-V 64
     tobuild_ops(linux.vfork linux/vfork.c "" "${execve-sub-path}")
     #tobuild(linux.vfork-fib linux/vfork-fib.c)
+    # Concurrent vfork children of different parent threads.
+    tobuild_ops(linux.vfork-concurrent linux/vfork-concurrent.c "" "${execve-sub-path}")
+    link_with_pthread(linux.vfork-concurrent)
   endif ()
   if (LINUX AND X86 AND X64)
     # The x87 probe is x86-64 assembly.

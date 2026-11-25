@@ -685,6 +685,8 @@ enum {
     FRAGDEL_NO_VMAREA = 0x040,
 
     FRAGDEL_NEED_CHLINK_LOCK = 0x080,
+    /* The caller invokes the client's fragment deletion event itself. */
+    FRAGDEL_NO_CLIENT_EVENT = 0x100,
 };
 void
 fragment_delete(dcontext_t *dcontext, fragment_t *f, uint actions);
@@ -1029,6 +1031,12 @@ enter_nolinking(dcontext_t *dcontext, fragment_t *watch, bool temporary);
 /* Returns false iff watch ends up being deleted */
 bool
 enter_couldbelinking(dcontext_t *dcontext, fragment_t *watch, bool temporary);
+
+void
+acquire_linking_lock_in_fragment(dcontext_t *dcontext);
+
+void
+release_linking_lock_in_fragment(dcontext_t *dcontext);
 
 void
 enter_threadexit(dcontext_t *dcontext);
