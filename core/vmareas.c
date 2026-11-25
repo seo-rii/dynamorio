@@ -7601,6 +7601,12 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
                 d_r_write_lock(&executable_areas->lock);
                 own_execareas_writelock = true;
                 ok = lookup_addr(executable_areas, pc, &area);
+                /* The area can have been removed while we did not hold the lock.
+                 * A failed lookup leaves our pointer from the first lookup in
+                 * place: clear it, as below we take a non-NULL area as found.
+                 */
+                if (!ok)
+                    area = NULL;
             }
             if (ok && TESTANY(VM_DELAY_READONLY, area->vm_flags))
                 handle_delay_readonly(dcontext, pc, area);
@@ -7624,6 +7630,14 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
             d_r_write_lock(&executable_areas->lock);
             own_execareas_writelock = true;
             ok = lookup_addr(executable_areas, pc, &area);
+            /* An area that was never executed from is removed without the flush
+             * synch (flush_fragments_in_region_start()), so it can be gone now
+             * even though we are couldbelinking.  A failed lookup leaves our
+             * pointer from the first lookup in place: clear it, as below we take
+             * a non-NULL area as found and would skip adding the region.
+             */
+            if (!ok)
+                area = NULL;
         }
         if (ok) {
             if (vmlist != NULL && !TESTANY(VM_EXECUTED_FROM, area->vm_flags)) {
