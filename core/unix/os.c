@@ -2720,6 +2720,16 @@ os_thread_init_finalize(dcontext_t *dcontext, void *os_data)
      * thread_initexit_lock (i#2779).
      */
     signal_thread_inherit(dcontext, os_data);
+#ifdef LINUX
+    /* The parent reclaims a vfork child when its vfork returns (see
+     * cleanup_after_vfork_execve()).  On Mac the vfork result is a pid, which
+     * finds no thread, so its vfork children are swept like other clones.
+     */
+    if (os_data != NULL) {
+        dcontext->thread_record->vfork_child =
+            TESTANY(CLONE_VFORK, get_clone_record_flags(os_data));
+    }
+#endif
 }
 
 void
@@ -6657,6 +6667,33 @@ handle_execve_post(dcontext_t *dcontext)
     }
 }
 
+/* i#1010: Reclaims children that called execve but were not created with
+ * CLONE_VFORK, before the numbers of their private fds are reused.  No parent
+ * waits for them, and we cannot tell when their execve has reached the kernel:
+ * one still in handle_execve() is reclaimed too, as it always was.  A vfork
+ * child is reclaimed only by its parent (cleanup_after_vfork_execve()).
+ */
+static void
+cleanup_after_clone_execve(dcontext_t *dcontext)
+{
+    thread_record_t **threads;
+    int num_threads, i;
+    if (num_execve_threads == 0)
+        return;
+    d_r_mutex_lock(&thread_initexit_lock);
+    get_list_of_threads_ex(&threads, &num_threads, true /*include execve*/);
+    for (i = 0; i < num_threads; i++) {
+        if (threads[i]->execve && !threads[i]->vfork_child) {
+            LOG(THREAD, LOG_SYSCALLS, 2, "cleaning up earlier clone thread " TIDFMT "\n",
+                threads[i]->id);
+            dynamo_other_thread_exit(threads[i]);
+        }
+    }
+    d_r_mutex_unlock(&thread_initexit_lock);
+    global_heap_free(threads,
+                     num_threads * sizeof(thread_record_t *) HEAPACCT(ACCT_THREAD_MGT));
+}
+
 /* Reclaim only the child whose CLONE_VFORK syscall has returned to this
  * parent.  Linux releases that parent only after the child has relinquished
  * the shared address space through execve or exit.  An execve marker alone is
@@ -7305,6 +7342,13 @@ handle_clone_pre(dcontext_t *dcontext)
         LOG(THREAD, LOG_SYSCALLS, 1, "\tWARNING: CLONE_VM not set!\n");
     }
 
+    /* i#1010: If we have private fds open (usually logfiles), we should
+     * clean those up before they get reused by a new thread.
+     * XXX: Ideally we'd do this in fd_table_add(), but we can't acquire
+     * thread_initexit_lock there.
+     */
+    cleanup_after_clone_execve(dcontext);
+
     /* For thread creation clone syscalls a clone_record_t structure
      * containing the pc after the app's syscall instr and other data
      * (see i#27) is placed at the bottom of the dstack (which is allocated
@@ -7822,6 +7866,7 @@ pre_system_call(dcontext_t *dcontext)
         uint flags = CLONE_VFORK | CLONE_VM | SIGCHLD;
         LOG(THREAD, LOG_SYSCALLS, 2, "syscall: vfork\n");
         handle_clone(dcontext, flags);
+        cleanup_after_clone_execve(dcontext);
 
         /* save for post_system_call, treated as if SYS_clone */
         dcontext->sys_param0 = (reg_t)flags;

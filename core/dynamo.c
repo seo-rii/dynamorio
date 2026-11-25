@@ -2170,6 +2170,7 @@ add_thread(IF_WINDOWS_ELSE_NP(HANDLE hthread, process_id_t pid), thread_id_t tid
 #else
     tr->pid = pid;
     tr->execve = false;
+    tr->vfork_child = false;
 #endif
     tr->id = tid;
     ASSERT(tid != INVALID_THREAD_ID); /* ensure os never assigns invalid id to a thread */

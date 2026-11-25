@@ -988,6 +988,13 @@ get_clone_record_app_xsp(void *record)
     return ((clone_record_t *)record)->app_thread_xsp;
 }
 
+uint64
+get_clone_record_flags(void *record)
+{
+    ASSERT(record != NULL);
+    return ((clone_record_t *)record)->clone_flags;
+}
+
 #ifdef MACOS
 void *
 get_clone_record_thread_arg(void *record)
