@@ -9821,6 +9821,8 @@ vm_area_unlink_fragments(dcontext_t *dcontext, app_pc start, app_pc end,
     for (i = data->areas.length - 1; i >= 0; i--) {
         /* look for overlap */
         if (start < data->areas.buf[i].end && end > data->areas.buf[i].start) {
+            DEBUG_DECLARE(bool already_marked =
+                              TESTANY(VM_DELETE_ME, data->areas.buf[i].vm_flags);)
             LOG(thread_log, LOG_FRAGMENT | LOG_VMAREAS, 2,
                 "\tmarking region " PFX ".." PFX
                 " for deletion & unlinking all its frags\n",
@@ -9844,9 +9846,16 @@ vm_area_unlink_fragments(dcontext_t *dcontext, app_pc start, app_pc end,
             }
             /* i#942: We can't flush a fragment list with multiple also entries
              * from the same fragment on it, or our iteration gets derailed.
+             * A thread-private area that an earlier flush marked, and that its
+             * thread has not yet freed in vm_area_flush_fragments(), also holds
+             * the fragments that flush moved onto it below.  Those can start
+             * outside the area, but they are unlinked and have no also entries,
+             * so this walk does not change the list.
              */
-            DOCHECK(CHKLVL_DEFAULT,
-                    { vm_area_check_clean_fraglist(&data->areas.buf[i]); });
+            DOCHECK(CHKLVL_DEFAULT, {
+                if (!already_marked)
+                    vm_area_check_clean_fraglist(&data->areas.buf[i]);
+            });
             ASSERT(!TESTANY(FRAG_COARSE_GRAIN, data->areas.buf[i].frag_flags));
             for (entry = data->areas.buf[i].custom.frags; entry != NULL; entry = next) {
                 fragment_t *f = FRAG_FRAG(entry);
