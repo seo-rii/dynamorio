@@ -6461,19 +6461,26 @@ add_executable_vm_areas_for_protection_change(app_pc base, size_t size, uint vm_
      */
     app_pc region_start = base;
     app_pc end = base + size;
-    d_r_write_lock(&executable_areas->lock);
-    /* We checked for executable areas without the lock, before deciding to add
-     * these.  Another thread can have executed the code since and added an area for
-     * it, with the old or the pending protection (see
-     * app_memory_protection_change_start()).  We leave that in place, and the rest
-     * of the region is added when it is executed.
+    /* add_executable_vm_area() must take the lock itself for a coarse-grain area,
+     * which is for a module's code: it checks the IAT and persisted caches, and the
+     * hotp lock ranks before ours.
      */
-    if (executable_vm_area_overlap(base, end, true /*have writelock*/)) {
-        LOG(GLOBAL, LOG_VMAREAS, 2,
-            "\tnot adding " PFX "-" PFX ": another thread added an area in it\n", base,
-            end);
-        d_r_write_unlock(&executable_areas->lock);
-        return;
+    bool hold_lock = !TESTANY(FRAG_COARSE_GRAIN, frag_flags);
+    if (hold_lock) {
+        d_r_write_lock(&executable_areas->lock);
+        /* We checked for executable areas without the lock, before deciding to add
+         * these.  Another thread can have executed the code since and added an area
+         * for it, with the old or the pending protection (see
+         * app_memory_protection_change_start()).  We leave that in place, and the
+         * rest of the region is added when it is executed.
+         */
+        if (executable_vm_area_overlap(base, end, true /*have writelock*/)) {
+            LOG(GLOBAL, LOG_VMAREAS, 2,
+                "\tnot adding " PFX "-" PFX ": another thread added an area in it\n",
+                base, end);
+            d_r_write_unlock(&executable_areas->lock);
+            return;
+        }
     }
     while (region_start < end) {
         app_pc region_end = end;
@@ -6497,10 +6504,11 @@ add_executable_vm_areas_for_protection_change(app_pc base, size_t size, uint vm_
             }
         }
         add_executable_vm_area(region_start, region_end, region_vm_flags,
-                               region_frag_flags, true /*have lock*/ _IF_DEBUG(comment));
+                               region_frag_flags, hold_lock _IF_DEBUG(comment));
         region_start = region_end;
     }
-    d_r_write_unlock(&executable_areas->lock);
+    if (hold_lock)
+        d_r_write_unlock(&executable_areas->lock);
 }
 
 /* Called when memory region base:base+size is about to have privileges prot.
