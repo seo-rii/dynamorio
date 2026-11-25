@@ -4877,7 +4877,12 @@ unlink_fragment_of_clean_call(dcontext_t *dcontext, thread_sig_info_t *info, byt
          dcontext->whereami != DR_WHERE_CLEAN_CALLEE) ||
         info->interrupted != NULL || !is_on_dstack(dcontext, xsp) ||
         (is_in_dynamo_dll(pc) && pc != (byte *)client_int_syscall + INT_LENGTH) ||
-        is_couldbelinking(dcontext))
+        is_couldbelinking(dcontext) ||
+        /* A callee that asked DR to flush is called back with DR's locks held:
+         * the flush completion callback and fragment deletion events.
+         */
+        is_self_flushing() || is_self_allsynch_flushing() ||
+        self_owns_recursive_lock(&change_linking_lock))
         return;
     /* An inline context switch leaves a stale value or zero here: only take the
      * return address of a call to the save routine.
