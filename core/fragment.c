@@ -3059,7 +3059,7 @@ fragment_delete(dcontext_t *dcontext, fragment_t *f, uint actions)
      * hashtable_fragment_reset().  If we add any further conditions on when it should
      * be invoked we should keep the two calls in synch.
      */
-    if (dr_fragment_deleted_hook_exists() &&
+    if (dr_fragment_deleted_hook_exists() && !TESTANY(FRAGDEL_NO_CLIENT_EVENT, actions) &&
         (!TESTANY(FRAGDEL_NO_HEAP, actions) || !TESTANY(FRAGDEL_NO_FCACHE, actions)))
         instrument_fragment_deleted(dcontext, f->tag, f->flags);
 #ifdef UNIX
@@ -5236,9 +5236,13 @@ fragment_self_write(dcontext_t *dcontext)
     /* We are nolinking, so a flusher takes us to be at a safe point and can be
      * unlinking our fragments right now, this one included, which also allocates
      * from our heap.  It holds our linking lock while it does: we hold it while we
-     * check for that and delete.
+     * check for that and delete.  The client's deletion event can call routines
+     * that take that lock (dr_app_pc_from_cache_pc(), for example), so we invoke
+     * it after releasing the lock.  It gets only the tag and flags.
      */
     per_thread_t *pt = (per_thread_t *)dcontext->fragment_field;
+    app_pc deleted_tag = NULL;
+    uint deleted_flags = 0;
     d_r_mutex_lock(&pt->linking_lock);
     if (TESTANY(FRAG_WAS_DELETED, dcontext->last_fragment->flags)) {
         /* Case 8177: case 3559 unionized fragment_t.in_xlate, so we cannot delete a
@@ -5249,10 +5253,14 @@ fragment_self_write(dcontext_t *dcontext)
         ASSERT(pt->flush_queue_nonempty);
         STATS_INC(num_self_writes_after_flushes);
     } else {
-        fragment_delete(dcontext, dcontext->last_fragment, FRAGDEL_ALL);
+        deleted_tag = dcontext->last_fragment->tag;
+        deleted_flags = dcontext->last_fragment->flags;
+        fragment_delete(dcontext, dcontext->last_fragment, FRAGDEL_NO_CLIENT_EVENT);
         STATS_INC(num_fragments_deleted_selfmod);
     }
     d_r_mutex_unlock(&pt->linking_lock);
+    if (deleted_tag != NULL && dr_fragment_deleted_hook_exists())
+        instrument_fragment_deleted(dcontext, deleted_tag, deleted_flags);
 }
 
 /* coarse_grain says to use just the min_pc and max_pc of f.

@@ -685,6 +685,8 @@ enum {
     FRAGDEL_NO_VMAREA = 0x040,
 
     FRAGDEL_NEED_CHLINK_LOCK = 0x080,
+    /* The caller invokes the client's fragment deletion event itself. */
+    FRAGDEL_NO_CLIENT_EVENT = 0x100,
 };
 void
 fragment_delete(dcontext_t *dcontext, fragment_t *f, uint actions);
