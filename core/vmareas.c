@@ -7271,6 +7271,41 @@ pending_protection_change(app_pc start, app_pc end, bool *to_writable /* OUT */)
     return found;
 }
 
+/* Narrows [*start, *end), which contains pc, so that it lies either within one
+ * pending protection change or outside all of them, and returns whether pc is in
+ * one that makes the code writable.  A memory region can span pages with
+ * different pending changes, or with none.  Caller must hold the executable_areas
+ * lock.
+ */
+static bool
+clip_to_pending_protection_change(app_pc pc, app_pc *start /* IN/OUT */,
+                                  app_pc *end /* IN/OUT */)
+{
+    vmvector_iterator_t vmvi;
+    bool to_writable = false;
+    if (vmvector_empty(pending_protection_changes))
+        return false;
+    vmvector_iterator_start(pending_protection_changes, &vmvi);
+    while (vmvector_iterator_hasnext(&vmvi)) {
+        app_pc entry_start, entry_end;
+        uint prot =
+            (uint)(ptr_uint_t)vmvector_iterator_next(&vmvi, &entry_start, &entry_end);
+        if (entry_end <= *start || entry_start >= *end)
+            continue;
+        if (pc >= entry_start && pc < entry_end) {
+            *start = MAX(*start, entry_start);
+            *end = MIN(*end, entry_end);
+            if (TESTANY(MEMPROT_WRITE, prot))
+                to_writable = true;
+        } else if (entry_end <= pc)
+            *start = MAX(*start, entry_end);
+        else
+            *end = MIN(*end, entry_start);
+    }
+    vmvector_iterator_stop(&vmvi);
+    return to_writable;
+}
+
 #ifdef DEBUG
 /* Checks that we do not build a block from code that we take for read-only while
  * its page is writable.
@@ -7317,8 +7352,15 @@ app_memory_protection_change_start(dcontext_t *dcontext, app_pc base, size_t siz
                                    uint old_prot, uint prot /* MEMPROT_ */)
 {
     app_pc end = (app_pc)ALIGN_FORWARD(base + size, PAGE_SIZE);
-    if (!INTERNAL_OPTION(hw_cache_consistency) ||
-        !TESTANY(MEMPROT_WRITE, old_prot | prot) || end <= base)
+    if (!INTERNAL_OPTION(hw_cache_consistency) || end <= base)
+        return;
+    /* old_prot is the protection we know of, which is read-only where we made
+     * writable code read-only ourselves (VM_MADE_READONLY).  The app takes that
+     * code for writable, and removing its area to apply the change restores the
+     * write permission until the system call: such a change is from writable too.
+     */
+    if (!TESTANY(MEMPROT_WRITE, old_prot | prot) &&
+        is_executable_area_writable_overlap(base, end) == NULL)
         return;
     /* The region need not have an executable area now: one can be added from the
      * old protection while the change is pending.  Most changes are to data, so
@@ -8368,8 +8410,11 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
              * app_memory_protection_change_start()): the protection we read can be
              * the old one, and page protection we set now can be undone.
              */
-            bool becoming_writable = false;
-            pending_protection_change(base_pc, base_pc + size, &becoming_writable);
+            app_pc area_start = base_pc, area_end = base_pc + size;
+            bool becoming_writable =
+                clip_to_pending_protection_change(pc, &area_start, &area_end);
+            base_pc = area_start;
+            size = area_end - area_start;
             if (becoming_writable) {
                 LOG(GLOBAL, LOG_VMAREAS, 2,
                     "\tNew executable region " PFX "-" PFX " is becoming writable\n",
@@ -11418,6 +11463,22 @@ vm_area_selfmod_check_clear_exec_count(dcontext_t *dcontext, fragment_t *f)
                                     false /* keep futures */, true /* exec invalid */,
                                     false /* don't force synchall */,
                                     THREAD_SYNCH_NO_LOCKS_NO_XFER _IF_DGCDIAG(NULL));
+    if (convert_s2ro) {
+        bool to_writable;
+        /* A thread that is making the region writable may not have changed the
+         * protection yet (see app_memory_protection_change_start()): the page would
+         * become writable again after we make it read-only, while we take it for
+         * read-only.  We keep it sandboxed, which is right for the new protection.
+         * flush_* grabbed executable_areas lock for us, which a change also takes
+         * to start and finish.
+         */
+        if (pending_protection_change(start, end, &to_writable) && to_writable) {
+            LOG(THREAD, LOG_VMAREAS, 2,
+                "\tnot converting " PFX "-" PFX " to ro: becoming writable\n", start,
+                end);
+            convert_s2ro = false;
+        }
+    }
     if (convert_s2ro) {
         DODEBUG(ro2s->s2ro_xfers++;);
         /* flush_* grabbed executable_areas lock for us */
