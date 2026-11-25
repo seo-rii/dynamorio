@@ -2968,6 +2968,11 @@ fragment_delete(dcontext_t *dcontext, fragment_t *f, uint actions)
 {
     bool acquired_shared_vm_lock = false;
     bool acquired_fragdel_lock = false;
+#ifdef UNIX
+    /* The signal handler may hold f to re-link it when the signal is delivered. */
+    if (dcontext != GLOBAL_DCONTEXT)
+        signal_forget_deleted_fragment(dcontext, f);
+#endif
     LOG(THREAD, LOG_FRAGMENT, 3,
         "fragment_delete: *" PFX " F%d(" PFX ")." PFX " %s 0x%x\n", f, f->id, f->tag,
         f->start_pc, TESTANY(FRAG_IS_TRACE, f->flags) ? "trace" : "bb", actions);

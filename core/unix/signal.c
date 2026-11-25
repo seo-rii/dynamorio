@@ -4547,6 +4547,22 @@ signal_forget_flushed_fragment(dcontext_t *dcontext)
     }
 }
 
+/* The thread itself can also delete the fragment we unlinked for a signal,
+ * without a flush: a sandboxed block that wrote to its own code, for example
+ * (fragment_self_write()).  Called from fragment_delete().
+ */
+void
+signal_forget_deleted_fragment(dcontext_t *dcontext, fragment_t *f)
+{
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    if (info != NULL && info->interrupted == f) {
+        LOG(THREAD, LOG_ASYNCH, 3, "\tinterrupted F%d is deleted: not re-linking\n",
+            f->id);
+        info->interrupted = NULL;
+        info->interrupted_pc = NULL;
+    }
+}
+
 static void
 relink_interrupted_fragment(dcontext_t *dcontext, thread_sig_info_t *info)
 {
