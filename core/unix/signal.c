@@ -980,6 +980,29 @@ get_clone_record(reg_t xsp)
     return (void *)record;
 }
 
+#ifdef LINUX
+void
+destroy_failed_clone_record(dcontext_t *dcontext, void *clone_record)
+{
+    clone_record_t *record = (clone_record_t *)clone_record;
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    ASSERT_OWN_MUTEX(true, &thread_initexit_lock);
+    ASSERT(record->parent_info == info && record->caller_id == dcontext->owning_thread);
+    if (!TESTANY(CLONE_SIGHAND, record->clone_flags)) {
+        /* Undo only this unstarted child's reservation from handle_clone().
+         * Shared-handler and itimer references are acquired by the child,
+         * so a failed clone has no child reference to release.
+         */
+        d_r_mutex_lock(&info->child_lock);
+        ASSERT(info->num_unstarted_children > 0);
+        info->num_unstarted_children--;
+        d_r_mutex_unlock(&info->child_lock);
+    }
+    /* The record itself is embedded in this never-used child stack. */
+    stack_free(record->dstack, DYNAMORIO_STACK_SIZE);
+}
+#endif
+
 /* i#149/PR 403015: App xsp is passed to the new thread via the clone record. */
 reg_t
 get_clone_record_app_xsp(void *record)

@@ -6000,6 +6000,8 @@ if (UNIX)
 
   if (NOT APPLE AND NOT RISCV64) # TODO i#3544: Port tests to RISC-V 64
     tobuild(linux.clone linux/clone.c)
+    # Failed thread-creation clones must release their reserved state.
+    tobuild(linux.clone-fail linux/clone-fail.c)
 
     # A PIE build tests MSR-based TLS instead of GDT-based (i#2089).
     tobuild(linux.clone-pie linux/clone.c)
