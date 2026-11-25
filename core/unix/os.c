@@ -2720,6 +2720,16 @@ os_thread_init_finalize(dcontext_t *dcontext, void *os_data)
      * thread_initexit_lock (i#2779).
      */
     signal_thread_inherit(dcontext, os_data);
+#ifdef LINUX
+    /* The parent reclaims a vfork child when its vfork returns (see
+     * cleanup_after_vfork_execve()).  On Mac the vfork result is a pid, which
+     * finds no thread, so its vfork children are swept like other clones.
+     */
+    if (os_data != NULL) {
+        dcontext->thread_record->vfork_child =
+            TESTANY(CLONE_VFORK, get_clone_record_flags(os_data));
+    }
+#endif
 }
 
 void
@@ -6525,13 +6535,10 @@ handle_execve(dcontext_t *dcontext)
      * SYS_execve: but execve seems more likely to fail than termination
      * syscalls.  Our solution is to mark this thread as "execve" and hide it
      * from regular thread queries; we clean it up in the process-exiting
-     * synch_with_thread(), or if the same parent thread performs another vfork
-     * (to prevent heap accumulation from repeated vfork+execve).  Since vfork
-     * on linux suspends the parent, there cannot be any races with the execve
-     * syscall completing: there can't even be peer vfork threads, so we could
-     * set a flag and clean up in d_r_dispatch, but that seems overkill.  (If vfork
-     * didn't suspend the parent we'd need to touch a marker file or something
-     * to know the execve was finished.)
+     * synch_with_thread(), or when the same parent thread returns from the
+     * vfork syscall.  Only that parent is suspended by Linux: other application
+     * threads can concurrently create their own vfork children.  They must not
+     * reclaim this thread merely because it has reached this execve marker.
      */
     mark_thread_execve(dcontext->thread_record, true);
 
@@ -6660,24 +6667,24 @@ handle_execve_post(dcontext_t *dcontext)
     }
 }
 
-/* i#237/PR 498284: to avoid accumulation of thread state we clean up a vfork
- * child who invoked execve here so we have at most one outstanding thread.  we
- * also clean up at process exit and before thread creation.  we could do this
- * in d_r_dispatch but too rare to be worth a flag check there.
+/* i#1010: Reclaims children that called execve but were not created with
+ * CLONE_VFORK, before the numbers of their private fds are reused.  No parent
+ * waits for them, and we cannot tell when their execve has reached the kernel:
+ * one still in handle_execve() is reclaimed too, as it always was.  A vfork
+ * child is reclaimed only by its parent (cleanup_after_vfork_execve()).
  */
 static void
-cleanup_after_vfork_execve(dcontext_t *dcontext)
+cleanup_after_clone_execve(dcontext_t *dcontext)
 {
     thread_record_t **threads;
     int num_threads, i;
     if (num_execve_threads == 0)
         return;
-
     d_r_mutex_lock(&thread_initexit_lock);
     get_list_of_threads_ex(&threads, &num_threads, true /*include execve*/);
     for (i = 0; i < num_threads; i++) {
-        if (threads[i]->execve) {
-            LOG(THREAD, LOG_SYSCALLS, 2, "cleaning up earlier vfork thread " TIDFMT "\n",
+        if (threads[i]->execve && !threads[i]->vfork_child) {
+            LOG(THREAD, LOG_SYSCALLS, 2, "cleaning up earlier clone thread " TIDFMT "\n",
                 threads[i]->id);
             dynamo_other_thread_exit(threads[i]);
         }
@@ -6685,6 +6692,27 @@ cleanup_after_vfork_execve(dcontext_t *dcontext)
     d_r_mutex_unlock(&thread_initexit_lock);
     global_heap_free(threads,
                      num_threads * sizeof(thread_record_t *) HEAPACCT(ACCT_THREAD_MGT));
+}
+
+/* Reclaim only the child whose CLONE_VFORK syscall has returned to this
+ * parent.  Linux releases that parent only after the child has relinquished
+ * the shared address space through execve or exit.  An execve marker alone is
+ * insufficient: a different parent thread may still have a vfork child in
+ * handle_execve(), before the kernel has even received the execve syscall.
+ */
+static void
+cleanup_after_vfork_execve(dcontext_t *dcontext, thread_id_t child_id)
+{
+    thread_record_t *child;
+    d_r_mutex_lock(&thread_initexit_lock);
+    child = thread_lookup(child_id);
+    if (child != NULL && child->execve) {
+        ASSERT(child != dcontext->thread_record);
+        LOG(THREAD, LOG_SYSCALLS, 2, "cleaning up completed vfork thread " TIDFMT "\n",
+            child_id);
+        dynamo_other_thread_exit(child);
+    }
+    d_r_mutex_unlock(&thread_initexit_lock);
 }
 
 /* XXX: Discover libc type at runtime and use appropriate stdfile_t variant
@@ -7311,7 +7339,7 @@ handle_clone_pre(dcontext_t *dcontext)
      * XXX: Ideally we'd do this in fd_table_add(), but we can't acquire
      * thread_initexit_lock there.
      */
-    cleanup_after_vfork_execve(dcontext);
+    cleanup_after_clone_execve(dcontext);
 
     /* For thread creation clone syscalls a clone_record_t structure
      * containing the pc after the app's syscall instr and other data
@@ -7852,7 +7880,7 @@ pre_system_call(dcontext_t *dcontext)
         uint flags = CLONE_VFORK | CLONE_VM | SIGCHLD;
         LOG(THREAD, LOG_SYSCALLS, 2, "syscall: vfork\n");
         handle_clone(dcontext, flags);
-        cleanup_after_vfork_execve(dcontext);
+        cleanup_after_clone_execve(dcontext);
 
         /* save for post_system_call, treated as if SYS_clone */
         dcontext->sys_param0 = (reg_t)flags;
@@ -9524,6 +9552,11 @@ post_system_call(dcontext_t *dcontext)
          * The child thread's tls setup is done in os_tls_app_seg_init.
          */
         if (was_thread_create_syscall(dcontext)) {
+            /* Read clone3 flags before freeing DR's saved clone_args. */
+            bool completed_vfork = success && result > 0 &&
+                TESTANY(CLONE_VFORK,
+                        sysnum == SYS_clone3 ? get_stored_clone3_flags(dcontext)
+                                             : dcontext->sys_param0);
             if (INTERNAL_OPTION(private_loader))
                 os_switch_lib_tls(dcontext, false /*to dr*/);
             /* i#2089: we already restored the DR tls in os_clone_post() */
@@ -9553,6 +9586,8 @@ post_system_call(dcontext_t *dcontext)
                 set_syscall_param(dcontext, SYSCALL_PARAM_CLONE_STACK,
                                   dcontext->sys_param1);
             }
+            if (completed_vfork)
+                cleanup_after_vfork_execve(dcontext, (thread_id_t)result);
         }
         break;
     }
@@ -9595,6 +9630,8 @@ post_system_call(dcontext_t *dcontext)
             }
             /* i#2089: we already restored the DR tls in os_clone_post() */
         }
+        if (success && result > 0)
+            cleanup_after_vfork_execve(dcontext, (thread_id_t)result);
         break;
     }
 #endif

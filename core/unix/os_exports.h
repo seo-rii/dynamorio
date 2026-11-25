@@ -575,6 +575,9 @@ create_clone_record(dcontext_t *dcontext, reg_t *app_thread_xsp,
 create_clone_record(dcontext_t *dcontext, reg_t *app_thread_xsp);
 #endif
 
+uint64
+get_clone_record_flags(void *record);
+
 #ifdef MACOS
 void *
 get_clone_record_thread_arg(void *record);

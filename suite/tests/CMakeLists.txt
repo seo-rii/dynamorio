@@ -6390,6 +6390,9 @@ if (UNIX)
     # TODO i#3544: Port tests to RISC-V 64
     tobuild_ops(linux.vfork linux/vfork.c "" "${execve-sub-path}")
     #tobuild(linux.vfork-fib linux/vfork-fib.c)
+    # Concurrent vfork children of different parent threads.
+    tobuild_ops(linux.vfork-concurrent linux/vfork-concurrent.c "" "${execve-sub-path}")
+    link_with_pthread(linux.vfork-concurrent)
   endif ()
   if (LINUX AND X86 AND X64)
     # The x87 probe is x86-64 assembly.
