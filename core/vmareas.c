@@ -953,6 +953,12 @@ add_vm_area(vm_area_vector_t *v, app_pc start, app_pc end, uint vm_flags, uint f
              /* never merge coarse-grain */
              !TESTANY(FRAG_COARSE_GRAIN, v->buf[i].frag_flags) &&
              !TESTANY(VECTOR_NEVER_MERGE_ADJACENT, v->flags) &&
+             /* With -page_granular_writable_code, a merged area would be flushed
+              * whole when any of its pages is written.
+              */
+             !(DYNAMO_OPTION(page_granular_writable_code) &&
+               TESTANY(VM_WRITABLE, vm_flags) &&
+               (v == executable_areas || TESTANY(VECTOR_FRAGMENT_LIST, v->flags))) &&
              (v->should_merge_func == NULL ||
               v->should_merge_func(true /*adjacent*/, data, v->buf[i].custom.client)))) {
             ASSERT(!(start < v->buf[i].end && end > v->buf[i].start) ||
@@ -7656,6 +7662,27 @@ allow_xfer_for_frag_flags(dcontext_t *dcontext, app_pc pc, uint src_flags, uint 
     return allow;
 }
 
+/* With -page_granular_writable_code, a new executable area in writable memory
+ * covers only the page holding pc, and such areas are not merged (see
+ * add_vm_area()).  A write fault then flushes only the fragments of the pages
+ * it writes, rather than every fragment from the enclosing OS region: a JIT
+ * that writes new code next to code it is running keeps the rest.
+ */
+static void
+clip_writable_code_to_page(app_pc pc, app_pc *base_pc, size_t *size)
+{
+    app_pc start = (app_pc)PAGE_START(pc), end = start + PAGE_SIZE;
+    if (!DYNAMO_OPTION(page_granular_writable_code))
+        return;
+    if (start < *base_pc)
+        start = *base_pc;
+    if (end > *base_pc + *size)
+        end = *base_pc + *size;
+    ASSERT(start <= pc && pc < end);
+    *base_pc = start;
+    *size = end - start;
+}
+
 /* check origins of code for several purposes:
  * 1) we need list of areas where this thread's fragments come
  *    from, for faster flushing on munmaps
@@ -8291,6 +8318,9 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
             STATS_INC(num_ro2sandbox_other_sub);
     }
 
+    if (area == NULL && TESTANY(MEMPROT_WRITE, prot))
+        clip_writable_code_to_page(pc, &base_pc, &size);
+
     /* now that we know about new area, decide whether it's compatible to be
      * in the same bb as previous areas, as dictated by old flags
      * N.B.: we only care about FRAG_ flags here, not VM_ flags
@@ -8457,6 +8487,7 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
                     prot |= (cur_prot & MEMPROT_WRITE);
             }
             if (TESTANY(MEMPROT_WRITE, prot) || becoming_writable) {
+                clip_writable_code_to_page(pc, &base_pc, &size);
                 vm_flags |= VM_WRITABLE;
                 STATS_INC(num_writable_code_regions);
                 /* Now that new area bounds are finalized, see if it should be

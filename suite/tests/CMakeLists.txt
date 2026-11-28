@@ -6288,6 +6288,14 @@ if (UNIX)
       tobuild_ops(linux.selfmod-fault linux/selfmod-fault.c
         "-ro2sandbox_threshold 1 -sandbox2ro_threshold 2" "")
       link_with_pthread(linux.selfmod-fault)
+      # Generated code on several pages, tracked one page at a time.
+      tobuild_ops(linux.selfmod-pages linux/selfmod-pages.c
+        "-page_granular_writable_code" "")
+      torunonly(linux.selfmod-pages-default linux.selfmod-pages
+        linux/selfmod-pages.c "" "")
+      torunonly(linux.selfmod-fault-pages linux.selfmod-fault linux/selfmod-fault.c
+        "-page_granular_writable_code -ro2sandbox_threshold 1 -sandbox2ro_threshold 2"
+        "")
     endif ()
 
     if (X86) # The test generates x86 code.
@@ -6919,6 +6927,10 @@ endif ()
 if (X86 OR AARCH64 AND NOT (APPLE AND AARCH64))
   tobuild(security-common.selfmod2 security-common/selfmod2.c)
   tochcon(security-common.selfmod2 textrel_shlib_t)
+  if (LINUX)
+    torunonly(security-common.selfmod2-pages security-common.selfmod2
+      security-common/selfmod2.c "-page_granular_writable_code" "")
+  endif ()
 
   tobuild(security-common.selfmod security-common/selfmod.c)
   tochcon(security-common.selfmod textrel_shlib_t)
@@ -6928,6 +6940,10 @@ if (X86) # XXX i#1551, i#1569: port asm to ARM and AArch64
   if (NOT APPLE) # XXX i#58: port test to MacOS
     tobuild(security-common.selfmod-big security-common/selfmod-big.c)
     tochcon(security-common.selfmod-big textrel_shlib_t)
+    if (LINUX)
+      torunonly(security-common.selfmod-big-pages security-common.selfmod-big
+        security-common/selfmod-big.c "-page_granular_writable_code" "")
+    endif ()
   endif ()
   if (NOT X64 AND NOT APPLE) # XXX i#58: port test to MacOS
     # XXX i#125
