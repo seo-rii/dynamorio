@@ -3994,10 +3994,12 @@ memcpy_rt_frame(sigframe_rt_t *frame, byte *dst, bool from_pending)
  * Also touches up fpstate pointer
  * dcontext can be NULL (which is why we take in info) in which case no check
  * versus executable memory is performed (we assume this is a native frame).
+ * If the frame cannot be written to sp and unwritable is non-NULL, sets
+ * *unwritable and returns without delivering SIGSEGV, which the caller must do.
  */
 static void
 copy_frame_to_stack(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
-                    sigframe_rt_t *frame, byte *sp, bool from_pending)
+                    sigframe_rt_t *frame, byte *sp, bool from_pending, bool *unwritable)
 {
     bool rtframe = IS_RT_FOR_APP(info, sig);
     uint frame_size = get_app_frame_size(info, sig);
@@ -4046,6 +4048,10 @@ copy_frame_to_stack(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
             },
             /* except */ { stack_unwritable = true; });
     }
+    if (stack_unwritable && unwritable != NULL) {
+        *unwritable = true;
+        return;
+    }
     if (stack_unwritable) {
         /* Override the no-nested check in record_pending_signal(): it's ok b/c
          * receive_pending_signal() calls to here at a consistent point,
@@ -4053,9 +4059,20 @@ copy_frame_to_stack(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
          */
         info->nested_pending_ok = true;
         /* Just throw away this signal and deliver SIGSEGV instead with the
-         * same sigcontext, like the kernel does.
+         * same sigcontext, like the kernel does.  Only a pending signal has an
+         * entry to free: a fault delivered from the cache was never queued.
          */
-        free_pending_signal(info, sig);
+        if (from_pending)
+            free_pending_signal(info, sig);
+        if (sig == SIGSEGV) {
+            /* When the kernel cannot deliver SIGSEGV itself it makes the signal
+             * fatal: it resets the handler and unblocks it (force_sigsegv()).
+             * Otherwise the SIGSEGV forged below would fail the same way again.
+             */
+            if (info->sighand->action[SIGSEGV] != NULL)
+                info->sighand->action[SIGSEGV]->handler = (handler_t)SIG_DFL;
+            kernel_sigdelset(&info->app_sigblocked, SIGSEGV);
+        }
         os_forge_exception(0, UNREADABLE_MEMORY_EXECUTION_EXCEPTION);
         ASSERT_NOT_REACHED();
     }
@@ -6486,7 +6503,35 @@ execute_handler_from_cache(dcontext_t *dcontext, int sig, sigframe_rt_t *our_fra
         terminate_sigsuspend(dcontext, info, uc);
 
     /* copy frame to appropriate stack and convert to non-rt if necessary */
-    copy_frame_to_stack(dcontext, info, sig, our_frame, (void *)xsp, false /*!pending*/);
+    bool unwritable = false;
+    copy_frame_to_stack(dcontext, info, sig, our_frame, (void *)xsp, false /*!pending*/,
+                        &unwritable);
+    if (unwritable) {
+        /* Like the kernel's force_sigsegv(): a SIGSEGV whose frame cannot be
+         * written is fatal, and another signal becomes a SIGSEGV, which is
+         * unblocked and takes the default action if ignored.  We are still in
+         * our own handler, where a forged signal would count as nested.
+         */
+        kernel_sigaction_t *segv = info->sighand->action[SIGSEGV];
+        LOG(THREAD, LOG_ASYNCH, 2, "\tcannot write the frame for signal %d at " PFX "\n",
+            sig, xsp);
+        if (segv != NULL && (sig == SIGSEGV || segv->handler == (handler_t)SIG_IGN))
+            segv->handler = (handler_t)SIG_DFL;
+        kernel_sigdelset(&info->app_sigblocked, SIGSEGV);
+        memset(&our_frame->info, 0, sizeof(our_frame->info));
+        our_frame->info.si_signo = SIGSEGV;
+        our_frame->info.si_code = IF_LINUX_ELSE(SI_KERNEL, 0);
+#ifdef X86_32
+        our_frame->sig = SIGSEGV;
+#endif
+        if (segv != NULL && segv->handler != (handler_t)SIG_DFL) {
+            return execute_handler_from_cache(dcontext, SIGSEGV, our_frame, sc_orig, f,
+                                              NULL);
+        }
+        if (execute_default_from_cache(dcontext, SIGSEGV, our_frame, sc_orig, false))
+            *get_sigcontext_from_rt_frame(our_frame) = *sc_orig;
+        return false;
+    }
     LOG(THREAD, LOG_ASYNCH, 3, "\tcopied frame from " PFX " to " PFX "\n", our_frame,
         xsp);
     sigcontext_t *app_sc = get_sigcontext_from_app_frame(info, sig, (void *)xsp);
@@ -6728,7 +6773,7 @@ execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
      * chance to make changes, copy the frame to the appropriate stack
      * location and convert to non-rt if necessary
      */
-    copy_frame_to_stack(dcontext, info, sig, frame, xsp, true /*pending*/);
+    copy_frame_to_stack(dcontext, info, sig, frame, xsp, true /*pending*/, NULL);
     /* now point at the app's frame */
     sc = get_sigcontext_from_app_frame(info, sig, (void *)xsp);
 
@@ -7093,7 +7138,7 @@ execute_native_handler(dcontext_t *dcontext, int sig, sigframe_rt_t *our_frame,
     /* We cannot reuse the current signal frame, therefore we create a copy. */
     byte *new_xsp = get_sigstack_frame_ptr(dcontext, info, sig, our_frame);
     copy_frame_to_stack(dcontext, info, sig, our_frame, (void *)new_xsp,
-                        false /*!pending*/);
+                        false /*!pending*/, NULL);
     DOLOG(2, LOG_ASYNCH, {
         LOG(THREAD, LOG_ASYNCH, 3, "Pre-signal blocked signals, stored in our frame:\n");
         dump_sigset(dcontext, (kernel_sigset_t *)&our_frame->uc.uc_sigmask);
@@ -8949,7 +8994,8 @@ sig_detach(dcontext_t *dcontext, sigframe_rt_t *frame, KSYNCH_TYPE *detached)
      * and that we're not clobbering any app data beyond TOS.
      */
     xsp = get_sigstack_frame_ptr(dcontext, info, SUSPEND_SIGNAL, frame);
-    copy_frame_to_stack(dcontext, info, SUSPEND_SIGNAL, frame, xsp, false /*!pending*/);
+    copy_frame_to_stack(dcontext, info, SUSPEND_SIGNAL, frame, xsp, false /*!pending*/,
+                        NULL);
 
 #ifdef HAVE_SIGALTSTACK
     /* Make sure the frame's sigstack reflects the app stack.

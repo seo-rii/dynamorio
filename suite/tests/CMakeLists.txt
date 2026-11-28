@@ -6221,6 +6221,9 @@ if (UNIX)
   if (LINUX AND X86) # The test generates x86 code and uses memfd_create().
     tobuild(linux.mmap-fixed-code linux/mmap-fixed-code.c)
   endif ()
+  if (LINUX AND X86 AND X64) # The test sets the stack pointer with x86-64 assembly.
+    tobuild(linux.signal-frame-unwritable linux/signal-frame-unwritable.c)
+  endif ()
   tobuild(linux.zero-length-mem-ranges linux/zero-length-mem-ranges.c)
   tobuild(linux.signal0000 linux/signal0000.c)
   tobuild(linux.signal0001 linux/signal0001.c)
