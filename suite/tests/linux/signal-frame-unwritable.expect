@@ -1,0 +1,9 @@
+overflow: killed by signal 11
+overflow-alt: exit 43
+segv: killed by signal 11
+ill: killed by signal 11
+ill-alt: exit 43
+usr1: killed by signal 11
+usr1-alt: exit 43
+usr1-segv: killed by signal 11
+all done
