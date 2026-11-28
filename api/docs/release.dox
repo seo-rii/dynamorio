@@ -322,6 +322,10 @@ Further non-compatibility-affecting changes include:
    on x86. It is currently only supported on Linux.
  - Added "zstd" to the drmemtrace -compress option for the final offline trace
    files, when built with libzstd.
+ - Added -page_granular_writable_code to track code in writable memory one page
+   at a time, so that a write flushes only the fragments of the pages it writes
+   rather than every fragment from the enclosing region.  This helps JIT
+   applications that write new code next to code they are running.
 
 **************************************************
 <hr>

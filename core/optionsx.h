@@ -1512,6 +1512,9 @@ OPTION_DEFAULT(uint, ro2sandbox_threshold, 10,
 OPTION_DEFAULT(
     uint, sandbox2ro_threshold, 20,
     "#executions in a sandboxed region before switching to page prot, 0 to disable")
+OPTION_DEFAULT(bool, page_granular_writable_code, false,
+               "track code in writable memory one page at a time, so that a write "
+               "flushes only the fragments of the pages it writes")
 
 OPTION_COMMAND(
     bool, sandbox_writable, false, "sandbox_writable",
